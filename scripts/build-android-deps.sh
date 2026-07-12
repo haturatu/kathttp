@@ -305,15 +305,22 @@ build_or_skip_abi() {
   )
 }
 
-declare -a BUILD_PIDS=()
+BUILD_PIDS=""
+active_builds=0
 for abi in "${ABIS[@]}"; do
   build_or_skip_abi "${abi}" &
-  BUILD_PIDS+=("$!")
+  BUILD_PIDS+=" $!"
+  ((active_builds += 1))
   # Limit simultaneously active ABI builds.  Each build uses --jobs workers,
   # so this avoids oversubscribing small GitHub-hosted runners.
-  if ((${#BUILD_PIDS[@]} >= ABI_PARALLELISM)); then
-    wait "${BUILD_PIDS[0]}"
-    BUILD_PIDS=("${BUILD_PIDS[@]:1}")
+  if ((active_builds >= ABI_PARALLELISM)); then
+    for pid in ${BUILD_PIDS}; do
+      wait "${pid}"
+    done
+    BUILD_PIDS=""
+    active_builds=0
   fi
 done
-for pid in "${BUILD_PIDS[@]}"; do wait "${pid}"; done
+for pid in ${BUILD_PIDS:-}; do
+  wait "${pid}"
+done
