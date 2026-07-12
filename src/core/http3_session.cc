@@ -1,7 +1,7 @@
 #include "http3_session.h"
 
-#include <ngtcp2/ngtcp2.h>
 #include <nghttp3/nghttp3.h>
+#include <ngtcp2/ngtcp2.h>
 
 #include <array>
 #include <charconv>
@@ -21,152 +21,143 @@ namespace kathttp {
 
 namespace {
 
-int begin_headers_cb(nghttp3_conn *, int64_t stream_id, void *conn_user_data,
-                      void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (job) job->response.headers.clear();
-  return 0;
+int begin_headers_cb(nghttp3_conn*, int64_t stream_id, void* conn_user_data,
+                     void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (job) job->response.headers.clear();
+    return 0;
 }
 
-int recv_header_cb(nghttp3_conn *, int64_t stream_id, int32_t token,
-                    nghttp3_rcbuf *name, nghttp3_rcbuf *value, uint8_t,
-                    void *conn_user_data, void * /*stream_user_data*/) {
-  (void)token;
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (!job) return 0;
-  nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
-  nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
-  if (n.len == 7 && std::memcmp(n.base, ":status", 7) == 0) {
-    // nghttp3_vec is a length-delimited view, not a NUL-terminated string.
-    // strtol could read past a short :status buffer and crash on a PATCH
-    // response.  Parse exactly the received bytes instead.
-    int status = 0;
-    const char *first = reinterpret_cast<const char *>(v.base);
-    const char *last = first + v.len;
-    auto [end, error] = std::from_chars(first, last, status);
-    if (error != std::errc{} || end != last || status < 100 || status > 599) {
-      return NGHTTP3_ERR_MALFORMED_HTTP_HEADER;
+int recv_header_cb(nghttp3_conn*, int64_t stream_id, int32_t token, nghttp3_rcbuf* name,
+                   nghttp3_rcbuf* value, uint8_t, void* conn_user_data,
+                   void* /*stream_user_data*/) {
+    (void)token;
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (!job) return 0;
+    nghttp3_vec n = nghttp3_rcbuf_get_buf(name);
+    nghttp3_vec v = nghttp3_rcbuf_get_buf(value);
+    if (n.len == 7 && std::memcmp(n.base, ":status", 7) == 0) {
+        // nghttp3_vec is a length-delimited view, not a NUL-terminated string.
+        // strtol could read past a short :status buffer and crash on a PATCH
+        // response.  Parse exactly the received bytes instead.
+        int status = 0;
+        const char* first = reinterpret_cast<const char*>(v.base);
+        const char* last = first + v.len;
+        auto [end, error] = std::from_chars(first, last, status);
+        if (error != std::errc{} || end != last || status < 100 || status > 599) {
+            return NGHTTP3_ERR_MALFORMED_HTTP_HEADER;
+        }
+        job->response.status_code = status;
+    } else {
+        job->response.headers.add(std::string(reinterpret_cast<const char*>(n.base), n.len),
+                                  std::string(reinterpret_cast<const char*>(v.base), v.len));
     }
-    job->response.status_code = status;
-  } else {
-    job->response.headers.add(
-        std::string(reinterpret_cast<const char *>(n.base), n.len),
-        std::string(reinterpret_cast<const char *>(v.base), v.len));
-  }
-  return 0;
+    return 0;
 }
 
-int end_headers_cb(nghttp3_conn *, int64_t stream_id, int /*fin*/,
-                    void *conn_user_data, void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (job)
-    c->client()->notify_job_headers(job, job->response.status_code,
-                                    job->response.headers);
-  return 0;
+int end_headers_cb(nghttp3_conn*, int64_t stream_id, int /*fin*/, void* conn_user_data,
+                   void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (job) c->client()->notify_job_headers(job, job->response.status_code, job->response.headers);
+    return 0;
 }
 
-int recv_data_cb(nghttp3_conn *, int64_t stream_id, const uint8_t *data,
-                   size_t len, void *conn_user_data, void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (!job) return 0;
-  c->client()->notify_job_body(job, data, len);
-  // Streaming (Flow) requests apply HTTP/3 receive flow-control: the window
-  // is extended only as the application consumes chunks (via consume()),
-  // so a slow consumer exerts backpressure on the peer. Buffered requests
-  // extend immediately.
-  if (!job->streaming) {
-    ngtcp2_conn_extend_max_stream_offset(c->client()->conn(), stream_id, len);
-    ngtcp2_conn_extend_max_offset(c->client()->conn(), len);
-  }
-  return 0;
-}
-
-int end_stream_cb(nghttp3_conn *, int64_t stream_id, void *conn_user_data,
-                   void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (job) {
-    job->completed = true;
-    c->client()->notify_job_complete(job);
-  }
-  return 0;
-}
-
-int stream_close_cb(nghttp3_conn *, int64_t stream_id, uint64_t app_error_code,
-                      void *conn_user_data, void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  auto *job = c->find_job(stream_id);
-  if (job && !job->completed) {
-    int err = KATHTTP_ERR_HTTP3;
-    // The stream ended without end_stream while a Content-Length was promised:
-    // treat as a truncated/length-mismatched body.
-    if (job->declared_content_length >= 0 &&
-        job->received_body_bytes < static_cast<uint64_t>(job->declared_content_length)) {
-      err = KATHTTP_ERR_BODY;
+int recv_data_cb(nghttp3_conn*, int64_t stream_id, const uint8_t* data, size_t len,
+                 void* conn_user_data, void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (!job) return 0;
+    c->client()->notify_job_body(job, data, len);
+    // Streaming (Flow) requests apply HTTP/3 receive flow-control: the window
+    // is extended only as the application consumes chunks (via consume()),
+    // so a slow consumer exerts backpressure on the peer. Buffered requests
+    // extend immediately.
+    if (!job->streaming) {
+        ngtcp2_conn_extend_max_stream_offset(c->client()->conn(), stream_id, len);
+        ngtcp2_conn_extend_max_offset(c->client()->conn(), len);
     }
-    c->client()->notify_job_error(job, err);
-  }
-  c->unmap_stream(stream_id);
-  return 0;
+    return 0;
 }
 
-int reset_stream_cb(nghttp3_conn *, int64_t stream_id, uint64_t app_error_code,
-                      void *conn_user_data, void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  ngtcp2_conn_shutdown_stream_write(c->client()->conn(), 0, stream_id,
-                                     app_error_code);
-  return 0;
+int end_stream_cb(nghttp3_conn*, int64_t stream_id, void* conn_user_data,
+                  void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (job) {
+        job->completed = true;
+        c->client()->notify_job_complete(job);
+    }
+    return 0;
 }
 
-int stop_sending_cb(nghttp3_conn *, int64_t stream_id, uint64_t app_error_code,
-                       void *conn_user_data, void * /*stream_user_data*/) {
-  auto *c = static_cast<Http3Session *>(conn_user_data);
-  ngtcp2_conn_shutdown_stream_read(c->client()->conn(), 0, stream_id,
-                                    app_error_code);
-  return 0;
+int stream_close_cb(nghttp3_conn*, int64_t stream_id, uint64_t app_error_code, void* conn_user_data,
+                    void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    auto* job = c->find_job(stream_id);
+    if (job && !job->completed) {
+        int err = KATHTTP_ERR_HTTP3;
+        // The stream ended without end_stream while a Content-Length was promised:
+        // treat as a truncated/length-mismatched body.
+        if (job->declared_content_length >= 0 &&
+            job->received_body_bytes < static_cast<uint64_t>(job->declared_content_length)) {
+            err = KATHTTP_ERR_BODY;
+        }
+        c->client()->notify_job_error(job, err);
+    }
+    c->unmap_stream(stream_id);
+    return 0;
 }
 
-int acked_stream_data_cb(nghttp3_conn *, int64_t, uint64_t, void *,
-                           void *) {
-  return 0;
+int reset_stream_cb(nghttp3_conn*, int64_t stream_id, uint64_t app_error_code, void* conn_user_data,
+                    void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    ngtcp2_conn_shutdown_stream_write(c->client()->conn(), 0, stream_id, app_error_code);
+    return 0;
 }
 
-int extend_max_stream_data_cb(nghttp3_conn *, int64_t, uint64_t, void *,
-                               void *) {
-  return 0;
+int stop_sending_cb(nghttp3_conn*, int64_t stream_id, uint64_t app_error_code, void* conn_user_data,
+                    void* /*stream_user_data*/) {
+    auto* c = static_cast<Http3Session*>(conn_user_data);
+    ngtcp2_conn_shutdown_stream_read(c->client()->conn(), 0, stream_id, app_error_code);
+    return 0;
 }
 
-int recv_settings_cb(nghttp3_conn *, const nghttp3_settings *,
-                      void *conn_user_data) {
-  (void)conn_user_data;
-  return 0;
+int acked_stream_data_cb(nghttp3_conn*, int64_t, uint64_t, void*, void*) {
+    return 0;
 }
 
-nghttp3_ssize data_read_cb(nghttp3_conn *, int64_t stream_id, nghttp3_vec *vec,
-                           size_t veccnt, uint32_t *pflags,
-                           void *stream_user_data, void *conn_user_data) {
-  (void)conn_user_data;
-  (void)veccnt;
-  auto *job = static_cast<Job *>(stream_user_data);
-  auto *req = job->request;
-  vec[0].base = nullptr;
-  vec[0].len = 0;
-  if (job->body_sent < req->body.size()) {
-    vec[0].base = req->body.data() + job->body_sent;
-    vec[0].len = req->body.size() - job->body_sent;
-    job->body_sent += vec[0].len;
-    // EOF must accompany the last non-empty DATA vector.  Waiting for a
-    // later zero-length callback leaves the request stream open and makes
-    // servers wait indefinitely for the end of a POST/PUT/PATCH body.
-    *pflags = job->body_sent == req->body.size() ? NGHTTP3_DATA_FLAG_EOF : 0;
-    return 1;
-  }
-  *pflags = NGHTTP3_DATA_FLAG_EOF;
-  return 0;
+int extend_max_stream_data_cb(nghttp3_conn*, int64_t, uint64_t, void*, void*) {
+    return 0;
+}
+
+int recv_settings_cb(nghttp3_conn*, const nghttp3_settings*, void* conn_user_data) {
+    (void)conn_user_data;
+    return 0;
+}
+
+nghttp3_ssize data_read_cb(nghttp3_conn*, int64_t stream_id, nghttp3_vec* vec, size_t veccnt,
+                           uint32_t* pflags, void* stream_user_data, void* conn_user_data) {
+    (void)conn_user_data;
+    (void)veccnt;
+    auto* job = static_cast<Job*>(stream_user_data);
+    auto* req = job->request;
+    vec[0].base = nullptr;
+    vec[0].len = 0;
+    if (job->body_sent < req->body.size()) {
+        vec[0].base = req->body.data() + job->body_sent;
+        vec[0].len = req->body.size() - job->body_sent;
+        job->body_sent += vec[0].len;
+        // EOF must accompany the last non-empty DATA vector.  Waiting for a
+        // later zero-length callback leaves the request stream open and makes
+        // servers wait indefinitely for the end of a POST/PUT/PATCH body.
+        *pflags = job->body_sent == req->body.size() ? NGHTTP3_DATA_FLAG_EOF : 0;
+        return 1;
+    }
+    *pflags = NGHTTP3_DATA_FLAG_EOF;
+    return 0;
 }
 
 constexpr nghttp3_callbacks kH3Callbacks = {
@@ -193,231 +184,217 @@ constexpr nghttp3_callbacks kH3Callbacks = {
 
 }  // namespace
 
-Http3Session::Http3Session(QuicClient *client, ngtcp2_conn *conn)
-    : client_(client), conn_(conn) {}
+Http3Session::Http3Session(QuicClient* client, ngtcp2_conn* conn) : client_(client), conn_(conn) {}
 
 Http3Session::~Http3Session() {
-  if (httpconn_) nghttp3_conn_del(httpconn_);
+    if (httpconn_) nghttp3_conn_del(httpconn_);
 }
 
-Job *Http3Session::find_job(int64_t stream_id) {
-  auto it = streams_.find(stream_id);
-  if (it == streams_.end()) return nullptr;
-  return it->second;
+Job* Http3Session::find_job(int64_t stream_id) {
+    auto it = streams_.find(stream_id);
+    if (it == streams_.end()) return nullptr;
+    return it->second;
 }
 
-void Http3Session::map_stream(int64_t stream_id, Job *job) {
-  streams_[stream_id] = job;
+void Http3Session::map_stream(int64_t stream_id, Job* job) {
+    streams_[stream_id] = job;
 }
 
 void Http3Session::unmap_stream(int64_t stream_id) {
-  streams_.erase(stream_id);
+    streams_.erase(stream_id);
 }
 
 bool Http3Session::setup_codec() {
-  nghttp3_settings settings;
-  nghttp3_settings_default(&settings);
-  nghttp3_conn *conn = nullptr;
-  int rv = nghttp3_conn_client_new_versioned(
-      &conn, NGHTTP3_CALLBACKS_VERSION, &kH3Callbacks,
-      NGHTTP3_SETTINGS_VERSION, &settings, nullptr, this);
-  if (rv != 0) {
-    KATHTTP_LOG_ERR("nghttp3_conn_client_new: %s\n",
-                     nghttp3_strerror(rv));
-    return false;
-  }
-  httpconn_ = conn;
-  int64_t control_id, encoder_id, decoder_id;
-  if (ngtcp2_conn_open_uni_stream(conn_, &control_id, nullptr) != 0 ||
-      ngtcp2_conn_open_uni_stream(conn_, &encoder_id, nullptr) != 0 ||
-      ngtcp2_conn_open_uni_stream(conn_, &decoder_id, nullptr) != 0 ||
-      nghttp3_conn_bind_control_stream(httpconn_, control_id) != 0 ||
-      nghttp3_conn_bind_qpack_streams(httpconn_, encoder_id, decoder_id) != 0) {
-    KATHTTP_LOG_ERR("failed to bind HTTP/3 critical streams\n");
-    nghttp3_conn_del(httpconn_);
-    httpconn_ = nullptr;
-    return false;
-  }
-  return true;
+    nghttp3_settings settings;
+    nghttp3_settings_default(&settings);
+    nghttp3_conn* conn = nullptr;
+    int rv = nghttp3_conn_client_new_versioned(&conn, NGHTTP3_CALLBACKS_VERSION, &kH3Callbacks,
+                                               NGHTTP3_SETTINGS_VERSION, &settings, nullptr, this);
+    if (rv != 0) {
+        KATHTTP_LOG_ERR("nghttp3_conn_client_new: %s\n", nghttp3_strerror(rv));
+        return false;
+    }
+    httpconn_ = conn;
+    int64_t control_id, encoder_id, decoder_id;
+    if (ngtcp2_conn_open_uni_stream(conn_, &control_id, nullptr) != 0 ||
+        ngtcp2_conn_open_uni_stream(conn_, &encoder_id, nullptr) != 0 ||
+        ngtcp2_conn_open_uni_stream(conn_, &decoder_id, nullptr) != 0 ||
+        nghttp3_conn_bind_control_stream(httpconn_, control_id) != 0 ||
+        nghttp3_conn_bind_qpack_streams(httpconn_, encoder_id, decoder_id) != 0) {
+        KATHTTP_LOG_ERR("failed to bind HTTP/3 critical streams\n");
+        nghttp3_conn_del(httpconn_);
+        httpconn_ = nullptr;
+        return false;
+    }
+    return true;
 }
 
-bool Http3Session::submit_request(Job *job) {
-  std::vector<nghttp3_nv> nva;
-  auto &url = job->url;
-  const auto &req = *job->request;
+bool Http3Session::submit_request(Job* job) {
+    std::vector<nghttp3_nv> nva;
+    auto& url = job->url;
+    const auto& req = *job->request;
 
-  auto add_nv = [&](const char *name, size_t nlen, const std::string &val) {
-    nva.push_back({reinterpret_cast<const uint8_t *>(name),
-                   reinterpret_cast<const uint8_t *>(val.data()), nlen,
-                   val.size(), NGHTTP3_NV_FLAG_NONE});
-  };
-  add_nv(":method", 7, req.method);
-  add_nv(":scheme", 7, url.scheme);
-  std::string authority = url.host;
-  if (!((url.scheme == "https" && url.port == 443) ||
-         (url.scheme == "http" && url.port == 80))) {
-    authority += ":";
-    authority += std::to_string(url.port);
-  }
-  add_nv(":authority", 10, authority);
-  std::string path = url.path.empty() ? "/" : url.path;
-  if (!url.query.empty()) {
-    path += "?";
-    path += url.query;
-  }
-  add_nv(":path", 5, path);
-
-  for (const auto &h : req.headers.list()) {
-    nva.push_back({reinterpret_cast<const uint8_t *>(h.name.data()),
-                   reinterpret_cast<const uint8_t *>(h.value.data()),
-                   h.name.size(), h.value.size(), NGHTTP3_NV_FLAG_NONE});
-  }
-
-  nghttp3_data_reader dr{data_read_cb};
-  const nghttp3_data_reader *drp = nullptr;
-  if (!req.body.empty()) {
-    // Ensure a Content-Length is present so servers parse the body.
-    bool has_cl = false;
-    for (const auto &h : req.headers.list()) {
-      if (strcasecmp(h.name.c_str(), "content-length") == 0) {
-        has_cl = true;
-        break;
-      }
+    auto add_nv = [&](const char* name, size_t nlen, const std::string& val) {
+        nva.push_back({reinterpret_cast<const uint8_t*>(name),
+                       reinterpret_cast<const uint8_t*>(val.data()), nlen, val.size(),
+                       NGHTTP3_NV_FLAG_NONE});
+    };
+    add_nv(":method", 7, req.method);
+    add_nv(":scheme", 7, url.scheme);
+    std::string authority = url.host;
+    if (!((url.scheme == "https" && url.port == 443) || (url.scheme == "http" && url.port == 80))) {
+        authority += ":";
+        authority += std::to_string(url.port);
     }
-    if (!has_cl) {
-      std::string cl = std::to_string(req.body.size());
-      nva.push_back(
-          {reinterpret_cast<const uint8_t *>("content-length"),
-           reinterpret_cast<const uint8_t *>(cl.data()), 14, cl.size(),
-           NGHTTP3_NV_FLAG_NONE});
+    add_nv(":authority", 10, authority);
+    std::string path = url.path.empty() ? "/" : url.path;
+    if (!url.query.empty()) {
+        path += "?";
+        path += url.query;
     }
-    drp = &dr;
-  }
+    add_nv(":path", 5, path);
 
-  int rv = nghttp3_conn_submit_request(httpconn_, job->stream_id, nva.data(),
-                                       nva.size(), drp, job);
-  if (rv != 0) {
-    KATHTTP_LOG_ERR("nghttp3_conn_submit_request: %s\n",
-                     nghttp3_strerror(rv));
-    return false;
-  }
-  map_stream(job->stream_id, job);
-  return true;
+    for (const auto& h : req.headers.list()) {
+        nva.push_back({reinterpret_cast<const uint8_t*>(h.name.data()),
+                       reinterpret_cast<const uint8_t*>(h.value.data()), h.name.size(),
+                       h.value.size(), NGHTTP3_NV_FLAG_NONE});
+    }
+
+    nghttp3_data_reader dr{data_read_cb};
+    const nghttp3_data_reader* drp = nullptr;
+    if (!req.body.empty()) {
+        // Ensure a Content-Length is present so servers parse the body.
+        bool has_cl = false;
+        for (const auto& h : req.headers.list()) {
+            if (strcasecmp(h.name.c_str(), "content-length") == 0) {
+                has_cl = true;
+                break;
+            }
+        }
+        if (!has_cl) {
+            std::string cl = std::to_string(req.body.size());
+            nva.push_back({reinterpret_cast<const uint8_t*>("content-length"),
+                           reinterpret_cast<const uint8_t*>(cl.data()), 14, cl.size(),
+                           NGHTTP3_NV_FLAG_NONE});
+        }
+        drp = &dr;
+    }
+
+    int rv =
+        nghttp3_conn_submit_request(httpconn_, job->stream_id, nva.data(), nva.size(), drp, job);
+    if (rv != 0) {
+        KATHTTP_LOG_ERR("nghttp3_conn_submit_request: %s\n", nghttp3_strerror(rv));
+        return false;
+    }
+    map_stream(job->stream_id, job);
+    return true;
 }
 
 void Http3Session::pump_write(ngtcp2_tstamp ts) {
-  if (!httpconn_) return;
-  uint8_t pkt[NGTCP2_MAX_PKTLEN];
-  // nghttp3 returns references to its queued stream bytes.  It does not write
-  // encoded bytes into a caller-provided buffer, and its return value is the
-  // number of vectors, not a byte length.  Passing a single pre-filled vector
-  // here used to forward a null data pointer to ngtcp2 for request bodies.
-  std::array<nghttp3_vec, 16> h3vec{};
-  for (;;) {
-    int64_t stream_id = -1;
-    int fin = 0;
-    nghttp3_ssize h3veccnt = nghttp3_conn_writev_stream(
-        httpconn_, &stream_id, &fin, h3vec.data(), h3vec.size());
-    if (h3veccnt < 0) {
-      KATHTTP_LOG_ERR("nghttp3_conn_writev_stream: %s\n",
-                       nghttp3_strerror((int)h3veccnt));
-      return;
-    }
-    if (h3veccnt == 0 && stream_id == -1) return;
+    if (!httpconn_) return;
+    uint8_t pkt[NGTCP2_MAX_PKTLEN];
+    // nghttp3 returns references to its queued stream bytes.  It does not write
+    // encoded bytes into a caller-provided buffer, and its return value is the
+    // number of vectors, not a byte length.  Passing a single pre-filled vector
+    // here used to forward a null data pointer to ngtcp2 for request bodies.
+    std::array<nghttp3_vec, 16> h3vec{};
+    for (;;) {
+        int64_t stream_id = -1;
+        int fin = 0;
+        nghttp3_ssize h3veccnt =
+            nghttp3_conn_writev_stream(httpconn_, &stream_id, &fin, h3vec.data(), h3vec.size());
+        if (h3veccnt < 0) {
+            KATHTTP_LOG_ERR("nghttp3_conn_writev_stream: %s\n", nghttp3_strerror((int)h3veccnt));
+            return;
+        }
+        if (h3veccnt == 0 && stream_id == -1) return;
 
-    uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
-    if (fin) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
-    ngtcp2_pkt_info pi{};
-    ngtcp2_ssize ndatalen = -1;
-    ngtcp2_ssize w = ngtcp2_conn_writev_stream(
-        client_->conn(), &client_->path(), &pi, pkt, sizeof(pkt), &ndatalen,
-        flags, stream_id,
-        reinterpret_cast<const ngtcp2_vec *>(h3vec.data()),
-        static_cast<size_t>(h3veccnt), ts);
-    if (w == NGTCP2_ERR_WRITE_MORE) {
-      if (ndatalen >= 0 &&
-          nghttp3_conn_add_write_offset(httpconn_, stream_id,
-                                        static_cast<size_t>(ndatalen)) != 0) {
-        KATHTTP_LOG_ERR("nghttp3_conn_add_write_offset failed\n");
-        return;
-      }
-      continue;
+        uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE;
+        if (fin) flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+        ngtcp2_pkt_info pi{};
+        ngtcp2_ssize ndatalen = -1;
+        ngtcp2_ssize w = ngtcp2_conn_writev_stream(
+            client_->conn(), &client_->path(), &pi, pkt, sizeof(pkt), &ndatalen, flags, stream_id,
+            reinterpret_cast<const ngtcp2_vec*>(h3vec.data()), static_cast<size_t>(h3veccnt), ts);
+        if (w == NGTCP2_ERR_WRITE_MORE) {
+            if (ndatalen >= 0 && nghttp3_conn_add_write_offset(
+                                     httpconn_, stream_id, static_cast<size_t>(ndatalen)) != 0) {
+                KATHTTP_LOG_ERR("nghttp3_conn_add_write_offset failed\n");
+                return;
+            }
+            continue;
+        }
+        if (w == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+            nghttp3_conn_block_stream(httpconn_, stream_id);
+            continue;
+        }
+        if (w == NGTCP2_ERR_STREAM_SHUT_WR) {
+            nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
+            continue;
+        }
+        if (w < 0) {
+            KATHTTP_LOG_ERR("ngtcp2_conn_writev_stream: %s\n", ngtcp2_strerror((int)w));
+            return;
+        }
+        if (ndatalen >= 0 && nghttp3_conn_add_write_offset(httpconn_, stream_id,
+                                                           static_cast<size_t>(ndatalen)) != 0) {
+            KATHTTP_LOG_ERR("nghttp3_conn_add_write_offset failed\n");
+            return;
+        }
+        if (w == 0) return;
+        if (w > 0) client_->send_packet(pkt, static_cast<size_t>(w));
     }
-    if (w == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-      nghttp3_conn_block_stream(httpconn_, stream_id);
-      continue;
-    }
-    if (w == NGTCP2_ERR_STREAM_SHUT_WR) {
-      nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
-      continue;
-    }
-    if (w < 0) {
-      KATHTTP_LOG_ERR("ngtcp2_conn_writev_stream: %s\n",
-                       ngtcp2_strerror((int)w));
-      return;
-    }
-    if (ndatalen >= 0 &&
-        nghttp3_conn_add_write_offset(httpconn_, stream_id,
-                                      static_cast<size_t>(ndatalen)) != 0) {
-      KATHTTP_LOG_ERR("nghttp3_conn_add_write_offset failed\n");
-      return;
-    }
-    if (w == 0) return;
-    if (w > 0) client_->send_packet(pkt, static_cast<size_t>(w));
-  }
 }
 
-bool Http3Session::recv_stream_data(uint32_t, int64_t stream_id,
-                                      const uint8_t *data, size_t len, bool fin,
-                                      ngtcp2_tstamp ts) {
-  if (!httpconn_) return false;
-  int rv = nghttp3_conn_read_stream(httpconn_, stream_id, data, len,
-                                    fin ? 1 : 0);
-  if (rv < 0) {
-    KATHTTP_LOG_ERR("nghttp3_conn_read_stream: %s\n",
-                     nghttp3_strerror(rv));
-    return false;
-  }
-  ngtcp2_conn_extend_max_stream_offset(client_->conn(), stream_id,
-                                       static_cast<uint64_t>(rv));
-  ngtcp2_conn_extend_max_offset(client_->conn(), static_cast<uint64_t>(rv));
-  return true;
+bool Http3Session::recv_stream_data(uint32_t, int64_t stream_id, const uint8_t* data, size_t len,
+                                    bool fin, ngtcp2_tstamp ts) {
+    if (!httpconn_) return false;
+    int rv = nghttp3_conn_read_stream(httpconn_, stream_id, data, len, fin ? 1 : 0);
+    if (rv < 0) {
+        KATHTTP_LOG_ERR("nghttp3_conn_read_stream: %s\n", nghttp3_strerror(rv));
+        return false;
+    }
+    ngtcp2_conn_extend_max_stream_offset(client_->conn(), stream_id, static_cast<uint64_t>(rv));
+    ngtcp2_conn_extend_max_offset(client_->conn(), static_cast<uint64_t>(rv));
+    return true;
 }
 
 bool Http3Session::acked_stream_data_offset(int64_t stream_id, uint64_t n) {
-  return !httpconn_ || nghttp3_conn_add_ack_offset(httpconn_, stream_id, n) == 0;
+    return !httpconn_ || nghttp3_conn_add_ack_offset(httpconn_, stream_id, n) == 0;
 }
 
-bool Http3Session::extend_max_stream_data(int64_t, uint64_t) { return true; }
+bool Http3Session::extend_max_stream_data(int64_t, uint64_t) {
+    return true;
+}
 
 bool Http3Session::on_stream_close(int64_t stream_id, uint64_t app_error_code) {
-  if (httpconn_) {
-    nghttp3_conn_close_stream(httpconn_, stream_id, app_error_code);
-  }
-  return true;
+    if (httpconn_) {
+        nghttp3_conn_close_stream(httpconn_, stream_id, app_error_code);
+    }
+    return true;
 }
 
 bool Http3Session::on_stream_reset(int64_t stream_id) {
-  if (httpconn_) nghttp3_conn_shutdown_stream_read(httpconn_, stream_id);
-  return true;
+    if (httpconn_) nghttp3_conn_shutdown_stream_read(httpconn_, stream_id);
+    return true;
 }
 
 bool Http3Session::on_stream_stop_sending(int64_t stream_id) {
-  if (httpconn_) nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
-  return true;
+    if (httpconn_) nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
+    return true;
 }
 
 void Http3Session::early_data_rejected() {
-  // We do not pipeline early-data requests; nothing to roll back.
+    // We do not pipeline early-data requests; nothing to roll back.
 }
 
 void Http3Session::reset_stream(int64_t stream_id) {
-  if (httpconn_) {
-    nghttp3_conn_shutdown_stream_read(httpconn_, stream_id);
-    nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
-  }
-  ngtcp2_conn_shutdown_stream_read(conn_, 0, stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
-  ngtcp2_conn_shutdown_stream_write(conn_, 0, stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
+    if (httpconn_) {
+        nghttp3_conn_shutdown_stream_read(httpconn_, stream_id);
+        nghttp3_conn_shutdown_stream_write(httpconn_, stream_id);
+    }
+    ngtcp2_conn_shutdown_stream_read(conn_, 0, stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
+    ngtcp2_conn_shutdown_stream_write(conn_, 0, stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
 }
 
 }  // namespace kathttp

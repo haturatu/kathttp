@@ -11,26 +11,25 @@ namespace kathttp {
  * `ext` must be a global JNI reference to an
  * android.net.ssl.X509TrustManagerExtensions instance. */
 class AndroidCertificateVerifier : public CertificateVerifier {
-public:
-  AndroidCertificateVerifier(JavaVM *vm, jobject ext);
-  ~AndroidCertificateVerifier() override;
+   public:
+    AndroidCertificateVerifier(JavaVM* vm, jobject ext);
+    ~AndroidCertificateVerifier() override;
 
-  AndroidCertificateVerifier(const AndroidCertificateVerifier &) = delete;
-  AndroidCertificateVerifier &operator=(const AndroidCertificateVerifier &) = delete;
+    AndroidCertificateVerifier(const AndroidCertificateVerifier&) = delete;
+    AndroidCertificateVerifier& operator=(const AndroidCertificateVerifier&) = delete;
 
-  VerifyResult verify(std::string_view hostname,
-                     const std::vector<DerCertificate> &chain,
-                     std::string_view auth_type) override;
+    VerifyResult verify(std::string_view hostname, const std::vector<DerCertificate>& chain,
+                        std::string_view auth_type) override;
 
-private:
-  JavaVM *vm_ = nullptr;
-  jobject ext_ = nullptr; /* global ref */
+   private:
+    JavaVM* vm_ = nullptr;
+    jobject ext_ = nullptr; /* global ref */
 };
 
 /* Builds the default-platform AndroidCertificateVerifier, or nullptr on
  * failure. The returned object is owned by the caller and must outlive
  * the engine (typically process-lifetime). */
-CertificateVerifier *create_android_platform_verifier(JavaVM *vm);
+CertificateVerifier* create_android_platform_verifier(JavaVM* vm);
 
 }  // namespace kathttp
 

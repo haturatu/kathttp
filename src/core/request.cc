@@ -1,68 +1,84 @@
 #include "request.h"
 
-#include "kathttp.h"
-#include <new>
 #include <cstring>
+#include <new>
+
+#include "kathttp.h"
 
 namespace {
-bool valid_header(const char *name, const char *value) {
-  if (!*name) return false;
-  for (const unsigned char *p = reinterpret_cast<const unsigned char *>(name); *p; ++p) {
-    if (*p <= 32 || *p >= 127 || *p == ':' || (*p >= 'A' && *p <= 'Z')) return false;
-  }
-  for (const unsigned char *p = reinterpret_cast<const unsigned char *>(value); *p; ++p)
-    if (*p == '\r' || *p == '\n' || *p == 0) return false;
-  return std::strcmp(name,"connection") != 0 && std::strcmp(name,"proxy-connection") != 0 &&
-         std::strcmp(name,"transfer-encoding") != 0 && std::strcmp(name,"upgrade") != 0 &&
-         std::strcmp(name,"host") != 0;
+bool valid_header(const char* name, const char* value) {
+    if (!*name) return false;
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(name); *p; ++p) {
+        if (*p <= 32 || *p >= 127 || *p == ':' || (*p >= 'A' && *p <= 'Z')) return false;
+    }
+    for (const unsigned char* p = reinterpret_cast<const unsigned char*>(value); *p; ++p)
+        if (*p == '\r' || *p == '\n' || *p == 0) return false;
+    return std::strcmp(name, "connection") != 0 && std::strcmp(name, "proxy-connection") != 0 &&
+           std::strcmp(name, "transfer-encoding") != 0 && std::strcmp(name, "upgrade") != 0 &&
+           std::strcmp(name, "host") != 0;
 }
-}
+}  // namespace
 
 extern "C" {
 
-kathttp_request *kathttp_request_create(const char *method, const char *url) {
-  if (!method || !url) return nullptr;
-  auto *r = new (std::nothrow) kathttp_request();
-  if (!r) return nullptr;
-  try { r->method = method; r->url = url; return r; }
-  catch (...) { delete r; return nullptr; }
+kathttp_request* kathttp_request_create(const char* method, const char* url) {
+    if (!method || !url) return nullptr;
+    auto* r = new (std::nothrow) kathttp_request();
+    if (!r) return nullptr;
+    try {
+        r->method = method;
+        r->url = url;
+        return r;
+    } catch (...) {
+        delete r;
+        return nullptr;
+    }
 }
 
-void kathttp_request_destroy(kathttp_request *request) { delete request; }
-
-int kathttp_request_add_header(kathttp_request *request, const char *name,
-                               const char *value) {
-  if (!request || !name || !value || !valid_header(name, value)) return KATHTTP_ERR_INVALID_ARG;
-  try { request->headers.add(name, value); return KATHTTP_OK; }
-  catch (...) { return KATHTTP_ERR_NOMEM; }
+void kathttp_request_destroy(kathttp_request* request) {
+    delete request;
 }
 
-int kathttp_request_set_body(kathttp_request *request, const uint8_t *data,
-                             size_t len) {
-  if (!request) return KATHTTP_ERR_INVALID_ARG;
-  if (data && len) {
-    try { request->body.assign(data, data + len); }
-    catch (...) { return KATHTTP_ERR_NOMEM; }
-  } else {
-    request->body.clear();
-  }
-  return KATHTTP_OK;
+int kathttp_request_add_header(kathttp_request* request, const char* name, const char* value) {
+    if (!request || !name || !value || !valid_header(name, value)) return KATHTTP_ERR_INVALID_ARG;
+    try {
+        request->headers.add(name, value);
+        return KATHTTP_OK;
+    } catch (...) {
+        return KATHTTP_ERR_NOMEM;
+    }
 }
 
-void kathttp_request_set_follow_redirects(kathttp_request *request,
-                                           int enable) {
-  if (request) request->follow_redirects = enable ? 1 : 0;
+int kathttp_request_set_body(kathttp_request* request, const uint8_t* data, size_t len) {
+    if (!request) return KATHTTP_ERR_INVALID_ARG;
+    if (data && len) {
+        try {
+            request->body.assign(data, data + len);
+        } catch (...) {
+            return KATHTTP_ERR_NOMEM;
+        }
+    } else {
+        request->body.clear();
+    }
+    return KATHTTP_OK;
 }
 
-void kathttp_request_set_streaming(kathttp_request *request, int enable) {
-  if (request) request->streaming = enable ? 1 : 0;
+void kathttp_request_set_follow_redirects(kathttp_request* request, int enable) {
+    if (request) request->follow_redirects = enable ? 1 : 0;
 }
 
-int kathttp_request_add_address(kathttp_request *request, const char *ip,
-                                uint16_t port) {
-  if (!request || !ip) return KATHTTP_ERR_INVALID_ARG;
-  try { request->addresses.emplace_back(std::string(ip), port); return KATHTTP_OK; }
-  catch (...) { return KATHTTP_ERR_NOMEM; }
+void kathttp_request_set_streaming(kathttp_request* request, int enable) {
+    if (request) request->streaming = enable ? 1 : 0;
+}
+
+int kathttp_request_add_address(kathttp_request* request, const char* ip, uint16_t port) {
+    if (!request || !ip) return KATHTTP_ERR_INVALID_ARG;
+    try {
+        request->addresses.emplace_back(std::string(ip), port);
+        return KATHTTP_OK;
+    } catch (...) {
+        return KATHTTP_ERR_NOMEM;
+    }
 }
 
 } /* extern "C" */

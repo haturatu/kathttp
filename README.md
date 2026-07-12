@@ -99,6 +99,34 @@ Build the APK after dependencies:
 ls -l example/build/outputs/apk/debug/example-debug.apk
 ```
 
+## Native code quality checks
+
+GitHub Actions runs native formatting, clang-tidy, cppcheck, and the host core
+tests under AddressSanitizer and UndefinedBehaviorSanitizer.  The default
+clang-tidy profile is deliberately staged: it reports selected bug-prone,
+analyzer, performance, portability, and low-noise modernize/readability checks
+without treating the existing baseline as errors.
+
+```sh
+# Formatting check / automatic formatting (generated CA bundle is excluded).
+find src include tests -type f ! -name ca_bundle.h \( -name '*.cc' -o -name '*.cpp' -o -name '*.c' -o -name '*.h' -o -name '*.hpp' \) -print0 | xargs -0 clang-format --dry-run --Werror
+find src include tests -type f ! -name ca_bundle.h \( -name '*.cc' -o -name '*.cpp' -o -name '*.c' -o -name '*.h' -o -name '*.hpp' \) -print0 | xargs -0 clang-format -i
+
+# Compilation database and clang-tidy/cppcheck without linking transport deps.
+cmake -S . -B build-tidy -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DKATHTTP_ANALYSIS_ONLY=ON -DKATHTTP_BUILD_JNI=OFF
+run-clang-tidy -p build-tidy -quiet
+cppcheck --project=build-tidy/compile_commands.json --enable=warning,style,performance,portability --inline-suppr --suppress=missingIncludeSystem --error-exitcode=1
+
+# ASan + UBSan for the core test suite.
+cmake -S . -B build-sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug -DKATHTTP_ANALYSIS_ONLY=ON -DKATHTTP_SANITIZE=ON -DKATHTTP_BUILD_JNI=OFF
+cmake --build build-sanitize --parallel
+ctest --test-dir build-sanitize --output-on-failure
+```
+
+Include What You Use is intentionally opt-in because external QUIC/TLS headers
+need project-specific mappings.  Install `include-what-you-use` and configure
+with `-DKATHTTP_ENABLE_IWYU=ON` when running this manual audit.
+
 The module uses compile SDK 36, minimum SDK 26, and Java/Kotlin JVM target 17.
 
 ### Publishing and consuming
