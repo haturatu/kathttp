@@ -4,13 +4,10 @@ ROOT_DIR := $(abspath ..)
 GRADLEW := $(ROOT_DIR)/gradlew
 ADB ?= adb
 APK := $(ROOT_DIR)/example/build/outputs/apk/debug/example-debug.apk
-KATHTTP_DEPS_ROOT ?=
+KATHTTP_DEPS_ROOT ?= $(ROOT_DIR)/third_party/android-deps
 DEVICE_SERIAL ?=
 
-GRADLE_ARGS := --no-daemon
-ifneq ($(strip $(KATHTTP_DEPS_ROOT)),)
-GRADLE_ARGS += -PkathttpDepsRoot=$(abspath $(KATHTTP_DEPS_ROOT))
-endif
+GRADLE_ARGS := --no-daemon -PkathttpDepsRoot=$(abspath $(KATHTTP_DEPS_ROOT))
 
 .PHONY: help assemble adbcheck adbinstall clean
 
@@ -21,12 +18,12 @@ help:
 	@echo "  make clean       Clean Android build outputs"
 	@echo ""
 	@echo "Variables:"
-	@echo "  KATHTTP_DEPS_ROOT=/path/to/android/deps"
+	@echo "  KATHTTP_DEPS_ROOT=/path/to/android/deps (default: ../third_party/android-deps)"
 	@echo "  DEVICE_SERIAL=<adb serial>  (required when multiple devices are connected)"
 	@echo "  ADB=/path/to/adb"
 
 assemble:
-	@test -n "$(KATHTTP_DEPS_ROOT)" || { echo "KATHTTP_DEPS_ROOT is required; see ../README.md" >&2; exit 2; }
+	@test -f "$(KATHTTP_DEPS_ROOT)/lib/arm64-v8a/libngtcp2.a" || { echo "Android dependencies are missing under $(KATHTTP_DEPS_ROOT); see ../README.md" >&2; exit 2; }
 	$(GRADLEW) $(GRADLE_ARGS) :example:assembleDebug
 	@test -f "$(APK)" || { echo "APK was not produced: $(APK)" >&2; exit 2; }
 

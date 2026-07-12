@@ -101,10 +101,10 @@ With one Android device connected through adb, the example can be built and inst
 
 ```sh
 cd example
-make adbinstall KATHTTP_DEPS_ROOT=/absolute/path/to/kathttp-android-deps
+make adbinstall
 ```
 
-When multiple devices are connected, add `DEVICE_SERIAL=<adb-serial>`. The target runs `:example:assembleDebug`, verifies the APK, and installs it with `adb install -r`.
+By default dependencies are read from `third_party/android-deps`; override this with `KATHTTP_DEPS_ROOT=/absolute/path` when needed. When multiple devices are connected, add `DEVICE_SERIAL=<adb-serial>`. The target runs `:example:assembleDebug`, verifies the APK, and installs it with `adb install -r`.
 
 ## Tests
 
