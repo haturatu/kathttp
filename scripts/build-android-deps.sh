@@ -2,8 +2,10 @@
 set -euo pipefail
 
 readonly ANDROID_API=26
-readonly BUILD_RECIPE_VERSION=2
+readonly BUILD_RECIPE_VERSION=3
 readonly ANDROID_CMAKE_VERSION=3.22.1
+readonly ANDROID_CMAKE_ARCHIVE_URL="https://dl.google.com/android/repository/cmake-3.22.1-linux.zip"
+readonly ANDROID_CMAKE_ARCHIVE_SHA256="9196644852a978012caf7a4067ba1898debf6cc204c3341562771e31080d6869"
 readonly ALL_ABIS=(arm64-v8a armeabi-v7a x86_64 x86)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -98,20 +100,49 @@ find_sdkmanager() {
   return 1
 }
 
+find_android_sdk_root() {
+  local ndk_sdk sdk
+  ndk_sdk="$(cd "${NDK}/../.." && pwd)"
+  for sdk in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "${ndk_sdk}"; do
+    [[ -n "${sdk}" && -d "${sdk}" ]] || continue
+    printf '%s\n' "${sdk}"
+    return
+  done
+  return 1
+}
+
+install_cmake_archive() {
+  local archive sdk target
+  sdk="$(find_android_sdk_root)" || {
+    echo "Android SDK root was not found while bootstrapping CMake." >&2
+    return 1
+  }
+  target="${sdk}/cmake/${ANDROID_CMAKE_VERSION}"
+  archive="$(mktemp "${TMPDIR:-/tmp}/kathttp-cmake.XXXXXX")"
+
+  echo "Downloading Android SDK CMake ${ANDROID_CMAKE_VERSION} from its pinned official archive." >&2
+  curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
+    "${ANDROID_CMAKE_ARCHIVE_URL}" --output "${archive}"
+  printf '%s  %s\n' "${ANDROID_CMAKE_ARCHIVE_SHA256}" "${archive}" | sha256sum -c - >&2
+  mkdir -p "${target}"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "${archive}" -d "${target}"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+      "${archive}" "${target}"
+  else
+    echo "Neither unzip nor python3 is available to extract the CMake archive." >&2
+    return 1
+  fi
+  rm -f "${archive}"
+  chmod +x "${target}/bin/cmake"
+}
+
 ensure_cmake() {
   local candidate sdk sdkmanager ndk_sdk
   if command -v cmake >/dev/null 2>&1; then
     return
   fi
-
-  if ! sdkmanager="$(find_sdkmanager)"; then
-    echo "CMake was not found and Android SDK Manager is unavailable." >&2
-    echo "Install CMake ${ANDROID_CMAKE_VERSION}, or set ANDROID_HOME/ANDROID_SDK_ROOT." >&2
-    exit 2
-  fi
-
-  echo "CMake was not found; installing Android SDK CMake ${ANDROID_CMAKE_VERSION}." >&2
-  "${sdkmanager}" --install "cmake;${ANDROID_CMAKE_VERSION}"
 
   ndk_sdk="$(cd "${NDK}/../.." && pwd)"
   for sdk in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "${ndk_sdk}"; do
@@ -122,6 +153,26 @@ ensure_cmake() {
       return
     fi
   done
+
+  # JitPack's legacy sdkmanager fails under Java 17 because its JAXB classes
+  # are absent.  The official archive has the same fixed SDK package layout,
+  # so install it directly instead of relying on the host Java runtime.
+  install_cmake_archive
+
+  for sdk in "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" "${ndk_sdk}"; do
+    [[ -n "${sdk}" ]] || continue
+    candidate="${sdk}/cmake/${ANDROID_CMAKE_VERSION}/bin"
+    if [[ -x "${candidate}/cmake" ]]; then
+      export PATH="${candidate}:${PATH}"
+      return
+    fi
+  done
+
+  # Keep a standard SDK Manager fallback for unusual SDK layouts after the
+  # archive attempt.  Its failure is intentionally non-fatal here.
+  if sdkmanager="$(find_sdkmanager 2>/dev/null)"; then
+    "${sdkmanager}" --install "cmake;${ANDROID_CMAKE_VERSION}" || true
+  fi
 
   echo "Android SDK CMake ${ANDROID_CMAKE_VERSION} was installed but could not be located." >&2
   exit 2
