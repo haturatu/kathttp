@@ -68,6 +68,8 @@ Build only one ABI or rebuild from clean state:
 ```sh
 scripts/build-android-deps.sh --abi arm64-v8a --jobs 8
 scripts/build-android-deps.sh --clean --abi arm64-v8a
+# Build two independent ABIs at once, with two compiler jobs per ABI.
+scripts/build-android-deps.sh --parallel-abis 2 --jobs 2
 ```
 
 The script is incremental and safe to run repeatedly. Sources are kept under `third_party/src`, intermediate files under `third_party/build-android`, and installed headers/libraries under `third_party/android-deps/<ABI>`. Supported ABIs are `arm64-v8a`, `armeabi-v7a`, `x86_64`, and `x86`; all target Android API 26.
@@ -81,6 +83,11 @@ the pinned revisions; the library-cache key additionally includes the build
 script. The build script validates each cached ABI (headers, all five libraries,
 API level, revisions, and recipe version) before skipping it, so an incomplete
 cache is rebuilt rather than used.
+
+The AAR workflow builds two ABI dependency sets concurrently and deliberately
+uses one compiler job per set, avoiding CPU oversubscription on hosted runners.
+The Gradle build cache and parallel project execution are enabled in
+`gradle.properties`.
 
 Build the APK after dependencies:
 

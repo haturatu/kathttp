@@ -69,6 +69,9 @@ jobs:
           chmod +x gradlew scripts/build-android-deps.sh
           ./gradlew \
             :kathttp:publishReleasePublicationToMavenLocal \
+            --parallel \
+            -PandroidNativeDepsJobs=1 \
+            -PandroidNativeDepsParallelAbis=2 \
             --stacktrace \
             --no-daemon
 

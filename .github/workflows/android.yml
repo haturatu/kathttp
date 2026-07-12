@@ -40,9 +40,9 @@ jobs:
           path: third_party/android-deps
           key: android-native-deps-${{ runner.os }}-arm64-v8a-api26-ndk27.0.12077973-${{ hashFiles('scripts/build-android-deps.sh', 'third_party/versions.env', 'third_party/versions.cmake') }}
       - name: Build pinned native dependencies
-        run: ./gradlew buildAndroidNativeDeps -PandroidNativeDepsAbi=arm64-v8a
+        run: ./gradlew --parallel buildAndroidNativeDeps -PandroidNativeDepsAbi=arm64-v8a -PandroidNativeDepsJobs=2
       - name: Build example APK
-        run: ./gradlew :example:assembleDebug -PkathttpAbis=arm64-v8a -PandroidNativeDepsAbi=arm64-v8a
+        run: ./gradlew --parallel :example:assembleDebug -PkathttpAbis=arm64-v8a -PandroidNativeDepsAbi=arm64-v8a -PandroidNativeDepsJobs=2
       - uses: actions/upload-artifact@v7
         with:
           name: kathttp-example-arm64-debug

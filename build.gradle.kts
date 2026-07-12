@@ -7,6 +7,7 @@ plugins {
 
 val nativeDepsAbi = providers.gradleProperty("androidNativeDepsAbi")
 val nativeDepsJobs = providers.gradleProperty("androidNativeDepsJobs")
+val nativeDepsParallelAbis = providers.gradleProperty("androidNativeDepsParallelAbis")
 
 tasks.register<Exec>("buildAndroidNativeDeps") {
     group = "build"
@@ -15,6 +16,9 @@ tasks.register<Exec>("buildAndroidNativeDeps") {
     val command = mutableListOf("bash", "scripts/build-android-deps.sh")
     nativeDepsAbi.orNull?.takeIf { it.isNotBlank() }?.let { command += listOf("--abi", it) }
     nativeDepsJobs.orNull?.takeIf { it.isNotBlank() }?.let { command += listOf("--jobs", it) }
+    nativeDepsParallelAbis.orNull?.takeIf { it.isNotBlank() }?.let {
+        command += listOf("--parallel-abis", it)
+    }
     commandLine(command)
     inputs.file("scripts/build-android-deps.sh")
     inputs.file("third_party/versions.env")

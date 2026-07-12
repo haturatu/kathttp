@@ -25,15 +25,17 @@ SOURCE_DIR="${ROOT_DIR}/third_party/src"
 BUILD_DIR="${ROOT_DIR}/third_party/build-android"
 OUTPUT_DIR="${ROOT_DIR}/third_party/android-deps"
 JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+ABI_PARALLELISM=1
 declare -a ABIS=()
 CLEAN=0
 
 usage() {
   cat <<EOF
-Usage: $0 [--clean] [--abi ABI]... [--jobs N]
+Usage: $0 [--clean] [--abi ABI]... [--jobs N] [--parallel-abis N]
 
 Builds pinned BoringSSL, nghttp3 and ngtcp2 static libraries with Android NDK.
-Supported ABIs: ${ALL_ABIS[*]}
+Supported ABIs: ${ALL_ABIS[*]}.  --jobs is the per-ABI build parallelism;
+--parallel-abis controls independent ABI builds (default: 1).
 EOF
 }
 
@@ -42,6 +44,7 @@ while (($#)); do
     --clean) CLEAN=1; shift ;;
     --abi) [[ $# -ge 2 ]] || { echo "--abi requires a value" >&2; exit 2; }; ABIS+=("$2"); shift 2 ;;
     --jobs) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--jobs requires a positive integer" >&2; exit 2; }; JOBS="$2"; shift 2 ;;
+    --parallel-abis) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || { echo "--parallel-abis requires a positive integer" >&2; exit 2; }; ABI_PARALLELISM="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -182,10 +185,30 @@ if ((needs_build)); then
   NGTCP2_SRC="$(checkout_source ngtcp2 https://github.com/ngtcp2/ngtcp2.git "${NGTCP2_VERSION}")"
 fi
 
+build_or_skip_abi() {
+  local abi="$1"
+  # CMake and compiler temporary files are isolated per ABI as well.  This
+  # permits multiple ABI builds without sharing a writable temporary path.
+  (
+    export TMPDIR="${ROOT_DIR}/.tmp/${abi}"
+    mkdir -p "${TMPDIR}"
+    if abi_is_complete "${abi}"; then
+      echo "==> [${abi}] cached output is complete; skipping rebuild"
+    else
+      build_abi "${abi}"
+    fi
+  )
+}
+
+declare -a BUILD_PIDS=()
 for abi in "${ABIS[@]}"; do
-  if abi_is_complete "${abi}"; then
-    echo "==> [${abi}] cached output is complete; skipping rebuild"
-  else
-    build_abi "${abi}"
+  build_or_skip_abi "${abi}" &
+  BUILD_PIDS+=("$!")
+  # Limit simultaneously active ABI builds.  Each build uses --jobs workers,
+  # so this avoids oversubscribing small GitHub-hosted runners.
+  if ((${#BUILD_PIDS[@]} >= ABI_PARALLELISM)); then
+    wait "${BUILD_PIDS[0]}"
+    BUILD_PIDS=("${BUILD_PIDS[@]:1}")
   fi
 done
+for pid in "${BUILD_PIDS[@]}"; do wait "${pid}"; done
