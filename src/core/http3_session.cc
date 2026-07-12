@@ -149,7 +149,10 @@ nghttp3_ssize data_read_cb(nghttp3_conn *, int64_t stream_id, nghttp3_vec *vec,
     vec[0].base = req->body.data() + job->body_sent;
     vec[0].len = req->body.size() - job->body_sent;
     job->body_sent += vec[0].len;
-    *pflags = 0;
+    // EOF must accompany the last non-empty DATA vector.  Waiting for a
+    // later zero-length callback leaves the request stream open and makes
+    // servers wait indefinitely for the end of a POST/PUT/PATCH body.
+    *pflags = job->body_sent == req->body.size() ? NGHTTP3_DATA_FLAG_EOF : 0;
     return 1;
   }
   *pflags = NGHTTP3_DATA_FLAG_EOF;

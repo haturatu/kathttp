@@ -138,7 +138,8 @@ private fun mapError(code: Int): KathttpException = when (code) {
     -3 -> QuicTransportException("QUIC transport error")
     -4 -> TlsHandshakeException("TLS handshake error")
     -5, -6, -7 -> CertificateVerificationException("Certificate verification failed (code $code)")
-    -9 -> KathttpException.Closed()
+    -9 -> KathttpException.Timeout()
+    -13 -> KathttpException.Closed()
     else -> KathttpException.Native(code)
 }
 

@@ -97,7 +97,8 @@ QuicClient *Engine::get_or_create_client(const Url &origin) {
   }
   auto qc = std::make_unique<QuicClient>(
       this, tls_ctx_, origin, resolver_, opt_.enable_0rtt != 0,
-      opt_.connect_timeout_ms, opt_.idle_timeout_ms, opt_.quic_version);
+      opt_.connect_timeout_ms, opt_.request_timeout_ms, opt_.idle_timeout_ms,
+      opt_.quic_version);
   QuicClient *p = qc.get();
   pool_.emplace(key, std::move(qc));
   return p;

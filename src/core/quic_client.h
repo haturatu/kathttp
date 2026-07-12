@@ -42,6 +42,7 @@ struct Job {
   Response response;
   bool saw_headers = false;
   size_t body_sent = 0;  /* request body bytes already offered to nghttp3 */
+  uint64_t submitted_at = 0;  /* monotonic timestamp; 0 until queued */
   int redirect_count = 0;
   /* Response body length accounting for Content-Length validation. */
   int64_t declared_content_length = -1; /* from Content-Length header, or -1 */
@@ -58,7 +59,8 @@ class QuicClient {
 public:
   QuicClient(Engine *engine, TlsClientContext &tls_ctx, const Url &origin,
               std::shared_ptr<Resolver> resolver, bool enable_0rtt,
-              uint64_t connect_timeout_ms, uint64_t idle_timeout_ms,
+              uint64_t connect_timeout_ms, uint64_t request_timeout_ms,
+              uint64_t idle_timeout_ms,
               uint32_t quic_version);
   ~QuicClient();
 
@@ -130,6 +132,7 @@ private:
   void drain_wakeup();
   void on_readable();
   void process_wakeup();
+  void expire_requests(uint64_t now);
 
   /* Pending HTTP/3 receive-window extensions (streaming backpressure),
    * drained on the worker thread. Pair = (stream_id, bytes). */
@@ -145,6 +148,7 @@ private:
   std::shared_ptr<Resolver> resolver_;
   bool enable_0rtt_;
   uint64_t connect_timeout_ms_;
+  uint64_t request_timeout_ms_;
   uint64_t idle_timeout_ms_;
   uint32_t quic_version_;
   bool http3_ready_ = false;

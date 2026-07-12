@@ -292,13 +292,15 @@ constexpr ngtcp2_callbacks kCallbacks = {
 QuicClient::QuicClient(Engine *engine, TlsClientContext &tls_ctx,
                          const Url &origin, std::shared_ptr<Resolver> resolver,
                          bool enable_0rtt, uint64_t connect_timeout_ms,
-                         uint64_t idle_timeout_ms, uint32_t quic_version)
+                         uint64_t request_timeout_ms, uint64_t idle_timeout_ms,
+                         uint32_t quic_version)
     : engine_(engine),
       tls_ctx_(tls_ctx),
       origin_(origin),
       resolver_(std::move(resolver)),
       enable_0rtt_(enable_0rtt),
       connect_timeout_ms_(connect_timeout_ms),
+      request_timeout_ms_(request_timeout_ms),
       idle_timeout_ms_(idle_timeout_ms),
       quic_version_(quic_version) {
   conn_ref_.get_conn = get_conn_cb;
@@ -334,6 +336,7 @@ void QuicClient::wakeup() {
 }
 
 void QuicClient::submit_job(std::unique_ptr<Job> job) {
+  job->submitted_at = now_ns();
   {
     std::lock_guard<std::mutex> lk(job_mutex_);
     pending_jobs_.push_back(std::move(job));
@@ -552,6 +555,7 @@ int QuicClient::event_loop() {
       return -1;
     }
 
+    expire_requests(now);
     try_submit_pending();
     write_pending();
 
@@ -565,6 +569,28 @@ int QuicClient::event_loop() {
     }
   }
   return 0;
+}
+
+void QuicClient::expire_requests(uint64_t now) {
+  if (request_timeout_ms_ == 0) return;
+  const uint64_t timeout_ns = request_timeout_ms_ * NGTCP2_MILLISECONDS;
+  std::vector<Job *> expired;
+  {
+    std::lock_guard<std::mutex> lk(job_mutex_);
+    auto collect_expired = [&](auto &jobs) {
+      for (auto &job : jobs) {
+        if (!job->cancelled && job->submitted_at != 0 &&
+            now - job->submitted_at >= timeout_ns) {
+          job->cancelled = true;
+          expired.push_back(job.get());
+        }
+      }
+    };
+    collect_expired(pending_jobs_);
+    collect_expired(active_jobs_);
+  }
+  for (auto *job : expired) notify_job_error(job, KATHTTP_ERR_TIMEOUT);
+  if (!expired.empty()) wakeup();
 }
 
 int QuicClient::compute_timeout(uint64_t now) {
