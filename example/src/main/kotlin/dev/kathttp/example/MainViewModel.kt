@@ -23,24 +23,24 @@ private val BODY_METHODS = setOf("POST", "PUT", "PATCH", "DELETE")
 data class RequestPreset(val url: String, val headers: String, val body: String)
 
 fun requestPreset(method: String): RequestPreset = when (method) {
-    "GET" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "accept: application/json", "")
+    "GET" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "", "")
     "POST" -> RequestPreset(
         "$HTTP3_TEST_ORIGIN/post",
-        "accept: application/json\ncontent-type: application/json",
-        "{\n  \"operation\": \"create\",\n  \"message\": \"Kathttp HTTP/3 POST test\"\n}",
+        "",
+        "",
     )
     "PUT" -> RequestPreset(
         "$HTTP3_TEST_ORIGIN/put",
-        "accept: application/json\ncontent-type: application/json",
-        "{\n  \"operation\": \"replace\",\n  \"message\": \"Kathttp HTTP/3 PUT test\"\n}",
+        "",
+        "",
     )
-    "DELETE" -> RequestPreset("$HTTP3_TEST_ORIGIN/delete", "accept: application/json", "")
+    "DELETE" -> RequestPreset("$HTTP3_TEST_ORIGIN/delete", "", "")
     "PATCH" -> RequestPreset(
         "$HTTP3_TEST_ORIGIN/patch",
-        "accept: application/json\ncontent-type: application/merge-patch+json",
-        "{\n  \"operation\": \"patch\",\n  \"message\": \"Kathttp HTTP/3 PATCH test\"\n}",
+        "",
+        "",
     )
-    "HEAD" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "accept: application/json", "")
+    "HEAD" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "", "")
     else -> error("Unsupported example method: $method")
 }
 
