@@ -27,7 +27,7 @@ jobs:
         run: >-
           sudo apt-get update -qq && sudo apt-get install -y
           clang clang-tidy cppcheck cmake ninja-build
-          libngtcp2-dev libnghttp3-dev libssl-dev
+          libngtcp2-dev libngtcp2-crypto-gnutls-dev libnghttp3-dev libssl-dev
       - name: Generate native compilation database
         run: >-
           cmake -S . -B build-tidy -G Ninja

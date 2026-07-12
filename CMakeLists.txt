@@ -56,7 +56,11 @@ set(KATHTTP_CORE_SOURCES
   src/core/udp_socket.cc src/core/url.cc)
 
 if(KATHTTP_ANALYSIS_ONLY)
-  add_library(kathttp OBJECT ${KATHTTP_CORE_SOURCES})
+  # Keep the production sources in compile_commands.json for clang-tidy, but
+  # do not make them part of the default build.  This lets the sanitizer job
+  # exercise the dependency-free unit-test target without requiring a host
+  # ngtcp2/nghttp3 installation.
+  add_library(kathttp OBJECT EXCLUDE_FROM_ALL ${KATHTTP_CORE_SOURCES})
 else()
   add_library(kathttp SHARED ${KATHTTP_CORE_SOURCES})
 endif()
@@ -105,5 +109,9 @@ if(KATHTTP_BUILD_TESTS AND NOT ANDROID)
     src/core/cookie_jar.cc)
   target_include_directories(kathttp_core_tests PRIVATE src/core)
   target_compile_options(kathttp_core_tests PRIVATE -Wall -Wextra -Wpedantic)
+  if(KATHTTP_SANITIZE)
+    target_compile_options(kathttp_core_tests PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(kathttp_core_tests PRIVATE -fsanitize=address,undefined)
+  endif()
   add_test(NAME kathttp_core_tests COMMAND kathttp_core_tests)
 endif()
