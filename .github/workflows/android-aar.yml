@@ -1,0 +1,65 @@
+name: Android AAR
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  aar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;27.0.12077973" \
+            "cmake;3.22.1"
+
+      - name: Build publication
+        run: |
+          chmod +x gradlew scripts/build-android-deps.sh
+          ./gradlew \
+            :kathttp:publishReleasePublicationToMavenLocal \
+            --stacktrace \
+            --no-daemon
+
+      - name: Inspect AAR
+        run: |
+          AAR="$(find kathttp/build/outputs/aar -name '*.aar' | head -1)"
+          test -n "${AAR}"
+          unzip -l "${AAR}"
+
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            unzip -l "${AAR}" | grep "jni/${abi}/libkathttp.so"
+          done
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: kathttp-aar
+          path: kathttp/build/outputs/aar/*.aar

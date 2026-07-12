@@ -1,0 +1,9 @@
+jdk:
+  - openjdk17
+
+before_install:
+  - chmod +x gradlew
+  - chmod +x scripts/build-android-deps.sh
+
+install:
+  - ./gradlew :kathttp:publishReleasePublicationToMavenLocal --stacktrace --no-daemon

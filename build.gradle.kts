@@ -16,7 +16,8 @@ tasks.register<Exec>("buildAndroidNativeDeps") {
     nativeDepsAbi.orNull?.takeIf { it.isNotBlank() }?.let { command += listOf("--abi", it) }
     nativeDepsJobs.orNull?.takeIf { it.isNotBlank() }?.let { command += listOf("--jobs", it) }
     commandLine(command)
-    inputs.files("scripts/build-android-deps.sh", "third_party/versions.cmake")
+    inputs.file("scripts/build-android-deps.sh")
+    inputs.file("third_party/versions.env")
+    inputs.file("third_party/versions.cmake")
     outputs.dir("third_party/android-deps")
-    outputs.upToDateWhen { false }
 }

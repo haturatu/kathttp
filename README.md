@@ -82,6 +82,29 @@ ls -l example/build/outputs/apk/debug/example-debug.apk
 
 The module uses compile SDK 36, minimum SDK 26, and Java/Kotlin JVM target 17.
 
+### Publishing and consuming
+
+The `:kathttp` module is configured with `maven-publish`. Building the release
+AAR first runs `buildAndroidNativeDeps` automatically (wired through `preBuild`),
+so a single command cross-compiles the pinned native dependencies for all four
+ABIs and packages `libkathttp.so` into the AAR:
+
+```sh
+./gradlew :kathttp:publishReleasePublicationToMavenLocal
+```
+
+The same command runs on JitPack via [`jitpack.yml`](jitpack.yml). Add JitPack as
+a repository and depend on the tag you want:
+
+```kotlin
+repositories { maven("https://jitpack.io") }
+dependencies { implementation("com.github.haturatu:kathttp:v0.1.0") }
+```
+
+For stable releases, build the AAR once in CI (`[Android AAR]` workflow), publish
+it to Maven Central, and depend on `dev.kathttp:kathttp:<version>` instead.
+
+
 Pinned dependencies and licenses:
 
 | Library | Version | License |
@@ -90,7 +113,7 @@ Pinned dependencies and licenses:
 | nghttp3 | `v1.17.0` | MIT |
 | ngtcp2 | `v1.24.0` | MIT |
 
-These exact revisions are present both in `scripts/build-android-deps.sh` and `third_party/versions.cmake`.
+These revisions are defined once in [`third_party/versions.env`](third_party/versions.env), which `scripts/build-android-deps.sh` sources and `third_party/versions.cmake` loads. Edit `versions.env` to bump a dependency.
 
 ### Certificate trust
 

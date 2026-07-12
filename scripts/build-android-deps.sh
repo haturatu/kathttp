@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly NGTCP2_VERSION="v1.24.0"
-readonly NGHTTP3_VERSION="v1.17.0"
-# This is the BoringSSL revision used by ngtcp2 v1.24.0 upstream CI.
-readonly BORINGSSL_REVISION="3c6315e00ab02d7bc9b8922aff1f85d8f81ee130"
 readonly ANDROID_API=26
 readonly ALL_ABIS=(arm64-v8a armeabi-v7a x86_64 x86)
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Load the single source of truth for dependency revisions.
+readonly VERSIONS_FILE="${ROOT_DIR}/third_party/versions.env"
+if [[ ! -f "${VERSIONS_FILE}" ]]; then
+  echo "Missing ${VERSIONS_FILE}" >&2
+  exit 1
+fi
+set -a
+# shellcheck source=/dev/null
+source "${VERSIONS_FILE}"
+set +a
+readonly NGTCP2_VERSION="${KATHTTP_NGTCP2_VERSION}"
+readonly NGHTTP3_VERSION="${KATHTTP_NGHTTP3_VERSION}"
+# This is the BoringSSL revision used by ngtcp2 v1.24.0 upstream CI.
+readonly BORINGSSL_REVISION="${KATHTTP_BORINGSSL_REVISION}"
 SOURCE_DIR="${ROOT_DIR}/third_party/src"
 BUILD_DIR="${ROOT_DIR}/third_party/build-android"
 OUTPUT_DIR="${ROOT_DIR}/third_party/android-deps"
