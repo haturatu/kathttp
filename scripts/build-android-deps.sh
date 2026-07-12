@@ -92,7 +92,7 @@ checkout_source() {
   local name="$1" url="$2" revision="$3" dir="${SOURCE_DIR}/$1"
   if [[ ! -d "$dir/.git" ]]; then
     rm -rf "$dir"
-    git clone --filter=blob:none --no-checkout "$url" "$dir"
+    git clone --no-checkout "$url" "$dir"
   fi
   if ! git -C "$dir" cat-file -e "${revision}^{commit}" 2>/dev/null; then
     git -C "$dir" fetch --depth 1 origin "$revision"
