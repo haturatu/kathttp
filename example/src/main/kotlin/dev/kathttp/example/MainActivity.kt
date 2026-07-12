@@ -62,7 +62,7 @@ private fun KathttpScreen(vm: MainViewModel = viewModel(), initialUrl: String? =
     ) {
         Text("Kathttp", style = MaterialTheme.typography.headlineMedium)
         Text(
-            "HTTP/3 request explorer — TLS 1.3 over QUIC. Enter an HTTPS URL served over HTTP/3.",
+            "HTTP/3 request explorer — TLS 1.3 over QUIC. Each method has a ready-to-send test preset.",
             style = MaterialTheme.typography.bodyMedium,
         )
 
@@ -72,11 +72,17 @@ private fun KathttpScreen(vm: MainViewModel = viewModel(), initialUrl: String? =
             modifier = Modifier.fillMaxWidth(),
             enabled = !state.loading,
             label = { Text("HTTPS URL") },
-            supportingText = { Text("The server must advertise HTTP/3 (h3) over UDP/443.") },
+            supportingText = {
+                Text("Method selection restores its nghttp2 HTTP/3 test preset. You can edit this URL freely.")
+            },
             singleLine = true,
         )
 
         Text("Method", style = MaterialTheme.typography.titleMedium)
+        Text(
+            "Choose a method, review its URL/body, then send. Selecting a method resets the test defaults.",
+            style = MaterialTheme.typography.bodySmall,
+        )
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp),

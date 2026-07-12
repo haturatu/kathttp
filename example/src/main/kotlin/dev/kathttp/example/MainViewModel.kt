@@ -15,14 +15,40 @@ import kotlinx.coroutines.withContext
 import kotlin.time.TimeSource
 
 private const val BODY_PREVIEW_CHAR_LIMIT = 16_000
+private const val HTTP3_TEST_ORIGIN = "https://nghttp2.org/httpbin"
 val HTTP_METHODS = listOf("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD")
 private val BODY_METHODS = setOf("POST", "PUT", "PATCH", "DELETE")
 
+/** A complete request which can be sent immediately to the public HTTP/3 test service. */
+data class RequestPreset(val url: String, val headers: String, val body: String)
+
+fun requestPreset(method: String): RequestPreset = when (method) {
+    "GET" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "accept: application/json", "")
+    "POST" -> RequestPreset(
+        "$HTTP3_TEST_ORIGIN/post",
+        "accept: application/json\ncontent-type: application/json",
+        "{\n  \"operation\": \"create\",\n  \"message\": \"Kathttp HTTP/3 POST test\"\n}",
+    )
+    "PUT" -> RequestPreset(
+        "$HTTP3_TEST_ORIGIN/put",
+        "accept: application/json\ncontent-type: application/json",
+        "{\n  \"operation\": \"replace\",\n  \"message\": \"Kathttp HTTP/3 PUT test\"\n}",
+    )
+    "DELETE" -> RequestPreset("$HTTP3_TEST_ORIGIN/delete", "accept: application/json", "")
+    "PATCH" -> RequestPreset(
+        "$HTTP3_TEST_ORIGIN/patch",
+        "accept: application/json\ncontent-type: application/merge-patch+json",
+        "{\n  \"operation\": \"patch\",\n  \"message\": \"Kathttp HTTP/3 PATCH test\"\n}",
+    )
+    "HEAD" -> RequestPreset("$HTTP3_TEST_ORIGIN/get", "accept: application/json", "")
+    else -> error("Unsupported example method: $method")
+}
+
 data class UiState(
-    val url: String = "https://",
+    val url: String = requestPreset("GET").url,
     val method: String = "GET",
-    val requestHeaders: String = "",
-    val requestBody: String = "{\n  \"hello\": \"HTTP/3 over QUIC\"\n}",
+    val requestHeaders: String = requestPreset("GET").headers,
+    val requestBody: String = requestPreset("GET").body,
     val loading: Boolean = false,
     val status: Int? = null,
     val responseHeaders: String = "",
@@ -43,16 +69,14 @@ class MainViewModel : ViewModel() {
     private var requestGeneration = 0L
 
     fun setUrl(value: String) = update { copy(url = value) }
+    /** Applies a ready-to-send URL, header and body set for [value]. */
     fun setMethod(value: String) = update {
+        val preset = requestPreset(value)
         copy(
             method = value,
-            // A useful JSON default is added only when the user selects a
-            // body-capable method; GET/HEAD remain free of body-specific headers.
-            requestHeaders = if (methodAllowsBody(value) && requestHeaders.isBlank()) {
-                "content-type: application/json"
-            } else {
-                requestHeaders
-            },
+            url = preset.url,
+            requestHeaders = preset.headers,
+            requestBody = preset.body,
         )
     }
     fun setRequestHeaders(value: String) = update { copy(requestHeaders = value) }
