@@ -20,7 +20,7 @@ std::vector<ResolvedEndpoint> GetAddrInfoResolver::resolve(
   std::string port_str = std::to_string(port);
   addrinfo *res = nullptr;
   if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
-    KATHTPP_LOG_ERR("getaddrinfo failed for %s:%u\n", host.c_str(), port);
+    KATHTTP_LOG_ERR("getaddrinfo failed for %s:%u\n", host.c_str(), port);
     return out;
   }
   for (addrinfo *rp = res; rp; rp = rp->ai_next) {
