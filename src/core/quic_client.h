@@ -1,0 +1,155 @@
+#ifndef KATHTPP_QUIC_CLIENT_H
+#define KATHTPP_QUIC_CLIENT_H
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <ngtcp2/ngtcp2.h>
+#include <ngtcp2/ngtcp2_crypto.h>
+#include <nghttp3/nghttp3.h>
+
+#include "dns.h"
+#include "response.h"
+#include "request.h"
+#include "tls.h"
+#include "udp_socket.h"
+#include "url.h"
+
+struct kathttp_request;
+
+namespace kathttp {
+
+class Engine;
+class Http3Session;
+
+/* One HTTP/3 request/response exchange multiplexed over a QuicClient. */
+struct Job {
+  int64_t id = 0;
+  kathttp_request *request = nullptr;  /* owned by Job */
+  Url url;
+  int64_t stream_id = -1;
+  bool http3_ready = false;
+  bool cancelled = false;
+  bool completed = false;
+  bool redirected = false;
+  Response response;
+  bool saw_headers = false;
+  size_t body_sent = 0;  /* request body bytes already offered to nghttp3 */
+  int redirect_count = 0;
+  ~Job() { delete request; }
+};
+
+/* Owns a single ngtcp2 QUIC connection plus its UDP socket and its own
+ * worker thread running a poll() loop. Multiplexes many Job (streams) over
+ * the one connection. Reused by the Engine's connection pool. */
+class QuicClient {
+public:
+  QuicClient(Engine *engine, TlsClientContext &tls_ctx, const Url &origin,
+              std::shared_ptr<Resolver> resolver, bool enable_0rtt,
+              uint64_t connect_timeout_ms, uint64_t idle_timeout_ms,
+              uint32_t quic_version);
+  ~QuicClient();
+
+  QuicClient(const QuicClient &) = delete;
+  QuicClient &operator=(const QuicClient &) = delete;
+
+  /* Called from the Engine thread. Queues the job and wakes the loop. */
+  void submit_job(std::unique_ptr<Job> job);
+
+  /* Called from any thread. Marks the job cancelled; the loop stops
+   * delivering its events and resets the stream if open. */
+  void cancel_job(int64_t job_id);
+
+  bool is_ready() const { return handshake_confirmed_.load(); }
+  bool is_closed() const { return closed_.load(); }
+
+  const Url &origin() const { return origin_; }
+  ngtcp2_conn *conn() { return conn_; }
+  ngtcp2_path &path() { return path_; }
+  void send_packet(const uint8_t *data, size_t len) {
+    sock_.send(data, len, 0);
+  }
+
+  void notify_job_headers(Job *job, int status, const HeaderList &headers);
+  void notify_job_body(Job *job, const uint8_t *data, size_t len);
+  void notify_job_complete(Job *job);
+  void notify_job_error(Job *job, int err);
+
+  void set_wakeup_fd(int fd);
+
+  /* Invoked by ngtcp2/nghttp3 C callbacks (defined as free functions in
+   * quic_client.cc / http3_session.cc). Public so those callbacks can reach
+   * them without friendship gymnastics. */
+  bool on_handshake_completed();
+  void on_handshake_confirmed();
+  void setup_codec();
+  bool on_extend_max_stream_data(int64_t stream_id);
+  bool on_acked_stream_data(int64_t stream_id, uint64_t datalen);
+  bool on_recv_stream_data(uint32_t flags, int64_t stream_id,
+                           const uint8_t *data, size_t len);
+  bool on_stream_close(int64_t stream_id, uint64_t app_error_code);
+  bool on_stream_reset(int64_t stream_id, uint64_t app_error_code);
+  bool on_stream_stop_sending(int64_t stream_id, uint64_t app_error_code);
+  void generate_reset_token(uint8_t *token, const ngtcp2_cid *cid);
+  void on_early_data_rejected();
+  void try_submit_pending();
+  void write_pending();
+
+private:
+  bool prepare_endpoints();
+  bool connect_to_endpoint();
+  bool setup_connection();
+  void run();
+  int event_loop();
+  int compute_timeout(uint64_t now);
+  void drain_wakeup();
+  void on_readable();
+  void process_wakeup();
+
+  void fail_all_pending(int err);
+  void wakeup();
+
+  Engine *engine_;
+  TlsClientContext &tls_ctx_;
+  Url origin_;
+  std::shared_ptr<Resolver> resolver_;
+  bool enable_0rtt_;
+  uint64_t connect_timeout_ms_;
+  uint64_t idle_timeout_ms_;
+  uint32_t quic_version_;
+  bool http3_ready_ = false;
+
+  std::thread thread_;
+  std::atomic<bool> closed_{false};
+  std::atomic<bool> handshake_confirmed_{false};
+  std::atomic<bool> stop_{false};
+
+  UdpSocket sock_;
+  int wakeup_fd_ = -1;
+  std::vector<ResolvedEndpoint> endpoints_;
+  size_t endpoint_idx_ = 0;
+
+  ngtcp2_conn *conn_ = nullptr;
+  ngtcp2_crypto_conn_ref conn_ref_{};
+  std::vector<uint8_t> stateless_reset_secret_;
+  ngtcp2_path path_{};
+
+  TlsClientSession tls_session_;
+  std::unique_ptr<Http3Session> http3_;
+
+  std::mutex job_mutex_;
+  std::vector<std::unique_ptr<Job>> pending_jobs_;  // not yet submitted
+  std::vector<std::unique_ptr<Job>> active_jobs_;   // submitted (stream open)
+  uint64_t last_active_ = 0;
+};
+
+} /* namespace kathttp */
+
+#endif /* KATHTPP_QUIC_CLIENT_H */

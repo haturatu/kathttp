@@ -1,0 +1,160 @@
+#ifndef KATHTPP_KATHTPP_H
+#define KATHTPP_KATHTPP_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ------------------------------------------------------------------ *
+ * ABI versioning
+ *
+ * The C ABI is kept stable by versioning every struct with a
+ * `struct_size` + `abi_version` header and never removing fields.
+ * New optional fields are only appended.
+ * ------------------------------------------------------------------ */
+#define KATHTPP_ABI_VERSION 1
+
+#if defined(_WIN32)
+# define KATHTTP_API __declspec(dllexport)
+#else
+# define KATHTTP_API __attribute__((visibility("default")))
+#endif
+
+typedef enum {
+  KATHTPP_OK = 0,
+  KATHTPP_ERR_DNS = -1,
+  KATHTPP_ERR_TLS = -2,
+  KATHTPP_ERR_QUIC = -3,
+  KATHTPP_ERR_HTTP3 = -4,
+  KATHTPP_ERR_TIMEOUT = -5,
+  KATHTPP_ERR_CANCELLED = -6,
+  KATHTPP_ERR_INVALID_ARG = -7,
+  KATHTPP_ERR_NOMEM = -8,
+  KATHTPP_ERR_CLOSED = -9, /* client destroyed while request in flight */
+} kathttp_error;
+
+/* Client construction options. Always initialize with
+ * kathttp_client_options_init() so struct_size/abi_version are set. */
+typedef struct kathttp_client_options {
+  uint32_t struct_size;
+  uint32_t abi_version;
+
+  uint64_t connect_timeout_ms;
+  uint64_t request_timeout_ms;
+  uint64_t idle_timeout_ms;
+  uint32_t max_redirects;
+  uint32_t max_connections_per_origin;
+  uint8_t enable_0rtt;     /* 0 = off. 0-RTT is off by default; replayable
+                              requests (GET/HEAD, no Authorization) only. */
+  const char *ca_cert_file; /* PEM CA bundle; NULL = built-in roots */
+  uint8_t verify_cert;      /* 1 = verify peer certificate */
+  const char *keylog_file;  /* NULL = disabled */
+  uint32_t quic_version;    /* 0 = let ngtcp2 negotiate */
+} kathttp_client_options;
+
+KATHTTP_API uint32_t kathttp_api_version(void);
+KATHTTP_API void kathttp_client_options_init(kathttp_client_options *opt);
+
+typedef struct kathttp_client kathttp_client;
+typedef struct kathttp_request kathttp_request;
+
+/* ------------------------------------------------------------------ *
+ * High-level events
+ *
+ * The engine delivers a small number of high-level events per request.
+ * It does NOT cross the JNI boundary for every UDP packet or every
+ * nghttp3 callback; the C++ layer coalesces them into these events.
+ *
+ * Lifetimes (guaranteed by the engine):
+ *  - All pointers in an event are valid only for the duration of the
+ *    event callback. Copy anything you need before returning.
+ *  - `request_id` is echoed in every event so the caller can map back
+ *    to its own per-request state.
+ *  - Exactly one terminal event (HEADERS+COMPLETE for success, or
+ *    ERROR) is delivered per request_id. It is delivered at most once.
+ *
+ * Threading (guaranteed by the engine):
+ *  - All events for a client are serialized on the engine's native
+ *    thread. The callback must not re-enter the engine or call engine
+ *    APIs that mutate shared state while running.
+ * ------------------------------------------------------------------ */
+typedef enum kathttp_event_type {
+  KATHTPP_EVENT_HEADERS = 1,  /* status_code + names/values/header_count */
+  KATHTPP_EVENT_BODY = 2,     /* data + data_len (may be called 0..n times) */
+  KATHTPP_EVENT_COMPLETE = 3, /* success; error_code == 0 */
+  KATHTPP_EVENT_ERROR = 4,    /* failure; error_code != 0 */
+} kathttp_event_type;
+
+typedef struct kathttp_event {
+  kathttp_event_type type;
+  int64_t request_id;
+
+  int status_code;            /* HEADERS */
+  const char *const *names;   /* HEADERS (header_count entries) */
+  const char *const *values;  /* HEADERS (header_count entries) */
+  size_t header_count;        /* HEADERS */
+
+  const uint8_t *data;        /* BODY */
+  size_t data_len;            /* BODY */
+
+  int error_code;             /* COMPLETE (0) / ERROR (non-zero) */
+} kathttp_event;
+
+typedef void (*kathttp_event_callback)(void *user_data,
+                                       const kathttp_event *event);
+
+/* ------------------------------------------------------------------ *
+ * Client lifecycle
+ * ------------------------------------------------------------------ */
+KATHTTP_API kathttp_client *kathttp_client_create(const kathttp_client_options *options);
+KATHTTP_API void kathttp_client_close(kathttp_client *client);
+KATHTTP_API void kathttp_client_destroy(kathttp_client *client);
+
+/* A tag combined into the connection-pool key. Use it to separate
+ * connections that share a (host, port) but differ in transport policy
+ * (e.g. a distinct Android Network, TLS policy or proxy). Two clients
+ * with different policy tags never share a QUIC connection. */
+KATHTTP_API void kathttp_client_set_origin_policy(kathttp_client *client,
+                                      const char *policy_tag);
+
+/* ------------------------------------------------------------------ *
+ * Request
+ *
+ * Ownership: kathttp_client_execute() takes ownership of `request`.
+ * Do not read, modify or free it after that call.
+ * ------------------------------------------------------------------ */
+KATHTTP_API kathttp_request *kathttp_request_create(const char *method, const char *url);
+KATHTTP_API void kathttp_request_destroy(kathttp_request *request);
+KATHTTP_API int kathttp_request_add_header(kathttp_request *request, const char *name,
+                               const char *value);
+KATHTTP_API int kathttp_request_set_body(kathttp_request *request, const uint8_t *data,
+                             size_t len);
+KATHTTP_API void kathttp_request_set_follow_redirects(kathttp_request *request, int enable);
+
+/* Pre-resolved address (IPv4/IPv6 string). When one or more addresses
+ * are supplied the engine skips its own DNS resolution and races them
+ * (happy-eyeballs). This is how an Android caller can feed IPs obtained
+ * via the platform DnsResolver bound to a specific Network. */
+KATHTTP_API int kathttp_request_add_address(kathttp_request *request, const char *ip,
+                                uint16_t port);
+
+/* Submit a request. `request_id` is an opaque token echoed back in
+ * every event; the caller uses it to correlate events with its own
+ * per-request state (e.g. a Kotlin coroutine registry entry). */
+KATHTTP_API void kathttp_client_execute(kathttp_client *client, kathttp_request *request,
+                            int64_t request_id, kathttp_event_callback cb,
+                            void *user_data);
+
+/* Request cancellation. Safe to call from any thread. If the request
+ * has already completed, this is a no-op. If still in flight, the
+ * engine will stop delivering further events for `request_id`. */
+KATHTTP_API void kathttp_client_cancel(kathttp_client *client, int64_t request_id);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* KATHTPP_KATHTPP_H */

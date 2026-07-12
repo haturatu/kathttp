@@ -1,0 +1,93 @@
+package dev.kathttp
+
+import dev.kathttp.internal.NativeBridge
+import dev.kathttp.internal.NativeCallback
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.receiveAsFlow
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+class KatHttpClient(private val config: KatHttpClientConfig = KatHttpClientConfig()) : AutoCloseable {
+    private val closed = AtomicBoolean(false)
+    private val ids = AtomicLong(1)
+    private val active = ConcurrentHashMap.newKeySet<Long>()
+    private val nativeLock = Any()
+    private val handle = NativeBridge.createClient(config.connectTimeoutMillis, config.requestTimeoutMillis, config.idleTimeoutMillis, config.maxRedirects, config.caCertificateFile).also { check(it != 0L) }
+
+    suspend fun execute(request: KatHttpRequest): KatHttpResponse = suspendCancellableCoroutine { continuation ->
+        if (closed.get()) { continuation.resumeWithException(KatHttpException.Closed()); return@suspendCancellableCoroutine }
+        val id = ids.getAndIncrement()
+        val callback = BufferedCallback(id, continuation)
+        active += id
+        continuation.invokeOnCancellation { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle, id) }; active.remove(id) }
+        val ok = synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle, id, request.method, request.url, request.headers.map { it.name }.toTypedArray(), request.headers.map { it.value }.toTypedArray(), request.body, config.followRedirects, callback) }
+        if (!ok) callback.fail(KatHttpException.Native(-7))
+    }
+
+    fun executeStreaming(request: KatHttpRequest): KatHttpCall {
+        check(!closed.get()) { "Client is closed" }
+        val id = ids.getAndIncrement()
+        val channel = Channel<KatHttpStreamEvent>(capacity = 8)
+        val call = KatHttpCall(channel.receiveAsFlow()) { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle, id) } }
+        val terminal = AtomicBoolean(false)
+        val callback = object : NativeCallback {
+            override fun onHeaders(status: Int, names: Array<String>, values: Array<String>) { if (!channel.trySend(KatHttpStreamEvent.Headers(status, names.indices.map { KatHttpHeader(names[it], values[it]) })).isSuccess) cancel() }
+            override fun onBody(data: ByteArray) { if (!channel.trySend(KatHttpStreamEvent.Body(data)).isSuccess) cancel() }
+            override fun onComplete() { if (terminal.compareAndSet(false,true)) { active.remove(id); channel.close() } }
+            override fun onError(code: Int) { if (terminal.compareAndSet(false,true)) { active.remove(id); channel.close(mapError(code)) } }
+            fun cancel() { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle,id) }; onError(-6) }
+        }
+        active += id
+        if (!synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle,id,request.method,request.url,request.headers.map{it.name}.toTypedArray(),request.headers.map{it.value}.toTypedArray(),request.body,config.followRedirects,callback) }) callback.onError(-7)
+        return call
+    }
+
+    override fun close() {
+        synchronized(nativeLock) { if (!closed.compareAndSet(false, true)) return }
+        NativeBridge.closeClient(handle)
+        active.clear()
+        NativeBridge.destroyClient(handle)
+    }
+
+    private inner class BufferedCallback(private val id: Long, private val continuation: CancellableContinuation<KatHttpResponse>) : NativeCallback {
+        private val terminal = AtomicBoolean(false)
+        private var status = 0
+        private var headers = emptyList<KatHttpHeader>()
+        private val body = ByteArrayOutputStream()
+        override fun onHeaders(status: Int, names: Array<String>, values: Array<String>) { if (!terminal.get()) { this.status = status; headers = names.indices.map { KatHttpHeader(names[it], values[it]) } } }
+        override fun onBody(data: ByteArray) {
+            if (terminal.get()) return
+            if (body.size().toLong() + data.size > config.maxBufferedBodyBytes) { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle, id) }; fail(KatHttpException.BodyTooLarge()) } else body.write(data)
+        }
+        override fun onComplete() { if (terminal.compareAndSet(false, true)) { active.remove(id); if (continuation.isActive) continuation.resume(KatHttpResponse(status, headers, body.toByteArray())) } }
+        override fun onError(code: Int) = fail(mapError(code))
+        fun fail(error: Throwable) { if (terminal.compareAndSet(false, true)) { active.remove(id); if (continuation.isActive) continuation.resumeWithException(error) } }
+    }
+}
+
+sealed interface KatHttpStreamEvent {
+    data class Headers(val status: Int, val headers: List<KatHttpHeader>) : KatHttpStreamEvent
+    data class Body(val bytes: ByteArray) : KatHttpStreamEvent
+}
+
+class KatHttpCall internal constructor(val events: Flow<KatHttpStreamEvent>, private val cancelAction: () -> Unit) : AutoCloseable {
+    private val cancelled = AtomicBoolean(false)
+    fun cancel() { if (cancelled.compareAndSet(false,true)) cancelAction() }
+    override fun close() = cancel()
+}
+
+private fun mapError(code: Int): KatHttpException = when (code) { -1 -> KatHttpException.Dns(); -2 -> KatHttpException.Tls(); -5 -> KatHttpException.Timeout(); -9 -> KatHttpException.Closed(); else -> KatHttpException.Native(code) }
+
+suspend fun KatHttpClient.get(url: String, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("GET", url, headers))
+suspend fun KatHttpClient.post(url: String, body: ByteArray, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("POST", url, headers, body))
+suspend fun KatHttpClient.put(url: String, body: ByteArray, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("PUT", url, headers, body))
+suspend fun KatHttpClient.delete(url: String, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("DELETE", url, headers))
+suspend fun KatHttpClient.patch(url: String, body: ByteArray, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("PATCH", url, headers, body))
+suspend fun KatHttpClient.head(url: String, headers: List<KatHttpHeader> = emptyList()) = execute(KatHttpRequest("HEAD", url, headers))
