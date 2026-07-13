@@ -102,7 +102,10 @@ QuicClient* Engine::get_or_create_client(const Url& origin) {
     auto it = pool_.find(key);
     if (it != pool_.end()) {
         if (it->second->is_closed() || it->second->is_draining()) {
-            it->second.reset();
+            // erase the entry itself. Keeping an empty entry makes the
+            // emplace below fail for this key, leaving us with a dangling
+            // pointer to the just-destroyed replacement client.
+            pool_.erase(it);
         } else {
             return it->second.get();
         }
