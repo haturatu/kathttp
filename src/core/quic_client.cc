@@ -355,7 +355,7 @@ bool QuicClient::prepare_endpoints() {
 
     std::vector<std::pair<std::string, uint16_t>> supplied_addresses;
     {
-        std::lock_guard<std::mutex> lock(job_mutex_);
+        std::lock_guard<std::mutex> jobs_lock(job_mutex_);
         if (pending_jobs_.empty()) return false;
         supplied_addresses = pending_jobs_.front()->request->addresses;
     }
@@ -740,6 +740,34 @@ int QuicClient::consume(int64_t request_id, size_t bytes) {
         std::lock_guard<std::mutex> lk(consume_mutex_);
         pending_consumes_.emplace_back(stream_id, bytes);
     }
+    wakeup();
+    return KATHTTP_OK;
+}
+
+int QuicClient::append_request_body(int64_t request_id, const uint8_t* data, size_t len,
+                                    bool finished) {
+    int64_t stream_id = -1;
+    {
+        std::lock_guard<std::mutex> lock(job_mutex_);
+        Job* target = nullptr;
+        for (auto& job : pending_jobs_)
+            if (job->id == request_id && !job->cancelled && !job->completed) target = job.get();
+        for (auto& job : active_jobs_)
+            if (job->id == request_id && !job->cancelled && !job->completed) target = job.get();
+        if (!target) return KATHTTP_ERR_CLOSED;
+        std::lock_guard<std::mutex> body_lock(target->request_body_mutex);
+        constexpr size_t kMaxBufferedRequestBodyBytes = 4 * 1024 * 1024;
+        if (len > kMaxBufferedRequestBodyBytes - target->request_body_buffered_bytes)
+            return KATHTTP_ERR_NOMEM;
+        if (target->request_body_finished) return KATHTTP_ERR_INVALID_ARG;
+        if (len) {
+            target->request_body_chunks.emplace_back(data, data + len);
+            target->request_body_buffered_bytes += len;
+        }
+        target->request_body_finished = finished;
+        stream_id = target->stream_id;
+    }
+    if (http3_ && stream_id >= 0) http3_->resume_stream(stream_id);
     wakeup();
     return KATHTTP_OK;
 }

@@ -74,8 +74,7 @@ int recv_header_cb(nghttp3_conn*, int64_t stream_id, int32_t token, nghttp3_rcbu
         const std::string header_value(reinterpret_cast<const char*>(v.base), v.len);
         if (header_name == "connection" || header_name == "keep-alive" ||
             header_name == "proxy-connection" || header_name == "transfer-encoding" ||
-            header_name == "upgrade" ||
-            (header_name == "te" && header_value != "trailers")) {
+            header_name == "upgrade" || (header_name == "te" && header_value != "trailers")) {
             return NGHTTP3_ERR_MALFORMED_HTTP_HEADER;
         }
         job->response.headers.add(header_name, header_value);
@@ -188,6 +187,39 @@ nghttp3_ssize data_read_cb(nghttp3_conn*, int64_t stream_id, nghttp3_vec* vec, s
     auto* req = job->request;
     vec[0].base = nullptr;
     vec[0].len = 0;
+    if (req->streaming_body) {
+        std::lock_guard<std::mutex> lock(job->request_body_mutex);
+        if (!job->request_body_chunks.empty() &&
+            job->request_body_chunk_offset == job->request_body_chunks.front().size()) {
+            job->request_body_chunks.pop_front();
+            job->request_body_chunk_offset = 0;
+        }
+        if (job->request_body_chunks.empty()) {
+            if (job->request_body_finished) {
+                if (req->streaming_body_length >= 0 &&
+                    job->body_sent != static_cast<size_t>(req->streaming_body_length))
+                    return NGHTTP3_ERR_CALLBACK_FAILURE;
+                *pflags = NGHTTP3_DATA_FLAG_EOF;
+                return 0;
+            }
+            return NGHTTP3_ERR_WOULDBLOCK;
+        }
+        auto& chunk = job->request_body_chunks.front();
+        if (req->streaming_body_length >= 0 &&
+            job->body_sent + chunk.size() - job->request_body_chunk_offset >
+                static_cast<size_t>(req->streaming_body_length))
+            return NGHTTP3_ERR_CALLBACK_FAILURE;
+        vec[0].base = chunk.data() + job->request_body_chunk_offset;
+        vec[0].len = chunk.size() - job->request_body_chunk_offset;
+        job->body_sent += vec[0].len;
+        job->request_body_buffered_bytes -= vec[0].len;
+        job->request_body_chunk_offset += vec[0].len;
+        *pflags = job->request_body_finished &&
+                          job->request_body_chunk_offset == job->request_body_chunks.front().size()
+                      ? NGHTTP3_DATA_FLAG_EOF
+                      : 0;
+        return 1;
+    }
     if (job->body_sent < req->body.size()) {
         vec[0].base = req->body.data() + job->body_sent;
         vec[0].len = req->body.size() - job->body_sent;
@@ -304,7 +336,7 @@ bool Http3Session::submit_request(Job* job) {
 
     nghttp3_data_reader dr{data_read_cb};
     const nghttp3_data_reader* drp = nullptr;
-    if (!req.body.empty()) {
+    if (!req.body.empty() || req.streaming_body) {
         // Ensure a Content-Length is present so servers parse the body.
         bool has_cl = false;
         for (const auto& h : req.headers.list()) {
@@ -313,8 +345,10 @@ bool Http3Session::submit_request(Job* job) {
                 break;
             }
         }
-        if (!has_cl) {
-            std::string cl = std::to_string(req.body.size());
+        if (!has_cl && (!req.streaming_body || req.streaming_body_length >= 0)) {
+            std::string cl =
+                std::to_string(req.streaming_body ? req.streaming_body_length
+                                                  : static_cast<int64_t>(req.body.size()));
             nva.push_back({reinterpret_cast<const uint8_t*>("content-length"),
                            reinterpret_cast<const uint8_t*>(cl.data()), 14, cl.size(),
                            NGHTTP3_NV_FLAG_NONE});
@@ -330,6 +364,10 @@ bool Http3Session::submit_request(Job* job) {
     }
     map_stream(job->stream_id, job);
     return true;
+}
+
+void Http3Session::resume_stream(int64_t stream_id) {
+    if (httpconn_) nghttp3_conn_resume_stream(httpconn_, stream_id);
 }
 
 void Http3Session::pump_write(ngtcp2_tstamp ts) {

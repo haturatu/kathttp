@@ -170,6 +170,18 @@ int Engine::consume(int64_t request_id, size_t bytes) {
     return c ? c->consume(request_id, bytes) : KATHTTP_ERR_CLOSED;
 }
 
+int Engine::append_request_body(int64_t request_id, const uint8_t* data, size_t len,
+                                bool finished) {
+    QuicClient* c = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        const auto it = registry_.find(request_id);
+        if (it == registry_.end() || it->second.terminal) return KATHTTP_ERR_CLOSED;
+        c = it->second.client;
+    }
+    return c ? c->append_request_body(request_id, data, len, finished) : KATHTTP_ERR_CLOSED;
+}
+
 void Engine::cancel(int64_t request_id) {
     std::lock_guard<std::recursive_mutex> callback_lock(callback_mutex_);
     QuicClient* c = nullptr;
@@ -562,6 +574,18 @@ kathttp_error kathttp_client_consume_body(kathttp_client* client, int64_t reques
             reinterpret_cast<kathttp::Engine*>(client)->consume(request_id, bytes));
     } catch (...) {
         return KATHTTP_ERR_CLOSED;
+    }
+}
+
+kathttp_error kathttp_client_request_body_append(kathttp_client* client, int64_t request_id,
+                                                 const uint8_t* data, size_t len, int finished) {
+    if (!client || (!data && len)) return KATHTTP_ERR_INVALID_ARG;
+    try {
+        return static_cast<kathttp_error>(
+            reinterpret_cast<kathttp::Engine*>(client)->append_request_body(request_id, data, len,
+                                                                            finished != 0));
+    } catch (...) {
+        return KATHTTP_ERR_NOMEM;
     }
 }
 

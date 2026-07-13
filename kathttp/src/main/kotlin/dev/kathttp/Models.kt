@@ -1,6 +1,8 @@
 package dev.kathttp
 
 import java.io.IOException
+import java.io.File
+import kotlinx.coroutines.flow.Flow
 
 /** Certificate trust policy, mapped to the native `kathttp_trust_mode`. */
 enum class TrustMode {
@@ -50,7 +52,13 @@ data class KatHttpHeader(val name: String, val value: String) {
     init { require(name.isNotBlank() && name == name.lowercase() && name.none { it <= ' ' || it == ':' }); require(value.none { it == '\r' || it == '\n' }) }
 }
 
-data class KatHttpRequest(val method: String, val url: String, val headers: List<KatHttpHeader> = emptyList(), val body: ByteArray? = null) {
+sealed interface KatHttpRequestBody {
+    data class Bytes(val value: ByteArray) : KatHttpRequestBody
+    data class FileBody(val file: File) : KatHttpRequestBody
+    data class Stream(val contentLength: Long? = null, val source: Flow<ByteArray>) : KatHttpRequestBody
+}
+
+data class KatHttpRequest(val method: String, val url: String, val headers: List<KatHttpHeader> = emptyList(), val body: ByteArray? = null, val streamingBody: KatHttpRequestBody? = null) {
     init { require(method.matches(Regex("[A-Z!#$%&'*+.^_`|~-]+"))); require(url.startsWith("https://")) }
 }
 

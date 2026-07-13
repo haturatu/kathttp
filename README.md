@@ -262,6 +262,10 @@ appended only. Symbols are hidden by default except `kathttp_*` exports.
   is intentionally excluded from production builds; a future cache must cover
   Cache-Control, Vary, Age, Date, Expires, ETag/Last-Modified revalidation,
   304 merging, no-store, stale-if-error, privacy, and Authorization semantics.
+- Request bodies support `ByteArray`, `File`, and a producer `Flow<ByteArray>`.
+  Flow/File data is bounded to 4 MiB in native memory and only resumes nghttp3
+  when chunks arrive. Empty producer chunks are rejected. HTTP/3 upload
+  interoperability still requires connected-server validation.
 - 0-RTT is disabled by default and session resumption persistence is not complete.
 - C ABI `destroy` requires a live handle; callers must null their handle after destroy. JNI detects stale/double-destroy handles.
 

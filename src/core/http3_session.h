@@ -34,6 +34,7 @@ class Http3Session {
     bool on_stream_stop_sending(int64_t stream_id);
     void early_data_rejected();
     void reset_stream(int64_t stream_id);
+    void resume_stream(int64_t stream_id);
 
     bool ready() const {
         return httpconn_ != nullptr;

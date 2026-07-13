@@ -319,7 +319,7 @@ Java_dev_kathttp_internal_NativeBridge_networkChanged(JNIEnv*, jobject, jlong h,
 extern "C" JNIEXPORT jboolean JNICALL Java_dev_kathttp_internal_NativeBridge_execute(
     JNIEnv* env, jobject, jlong h, jlong id, jstring method, jstring url, jobjectArray names,
     jobjectArray values, jbyteArray body, jboolean redirects, jboolean streaming,
-    jobject callback) {
+    jboolean streaming_request_body, jlong streaming_content_length, jobject callback) {
     auto* client = checked(h);
     if (!client || !method || !url || !callback) return JNI_FALSE;
     const char* m = env->GetStringUTFChars(method, nullptr);
@@ -360,6 +360,12 @@ extern "C" JNIEXPORT jboolean JNICALL Java_dev_kathttp_internal_NativeBridge_exe
     }
     kathttp_request_set_follow_redirects(req, redirects);
     kathttp_request_set_streaming(req, streaming);
+    if (streaming_request_body &&
+        kathttp_request_set_streaming_body(req, static_cast<int64_t>(streaming_content_length)) !=
+            KATHTTP_OK) {
+        kathttp_request_destroy(req);
+        return JNI_FALSE;
+    }
     auto* state = new (std::nothrow) CallbackState;
     if (!state) {
         kathttp_request_destroy(req);
@@ -382,4 +388,16 @@ Java_dev_kathttp_internal_NativeBridge_consume(JNIEnv*, jobject, jlong h, jlong 
     return kathttp_client_consume_body(client, id, static_cast<size_t>(bytes)) == KATHTTP_OK
                ? JNI_TRUE
                : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jint JNICALL Java_dev_kathttp_internal_NativeBridge_appendRequestBody(
+    JNIEnv* env, jobject, jlong h, jlong id, jbyteArray data, jboolean finished) {
+    auto* client = checked(h);
+    if (!client) return KATHTTP_ERR_CLOSED;
+    const jsize len = data ? env->GetArrayLength(data) : 0;
+    jbyte* bytes = data && len ? env->GetByteArrayElements(data, nullptr) : nullptr;
+    const auto result = kathttp_client_request_body_append(
+        client, id, reinterpret_cast<const uint8_t*>(bytes), static_cast<size_t>(len), finished);
+    if (bytes) env->ReleaseByteArrayElements(data, bytes, JNI_ABORT);
+    return result;
 }
