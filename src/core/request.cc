@@ -63,6 +63,14 @@ int kathttp_request_set_body(kathttp_request* request, const uint8_t* data, size
     return KATHTTP_OK;
 }
 
+int kathttp_request_set_streaming_body(kathttp_request* request, int64_t content_length) {
+    if (!request || content_length < -1) return KATHTTP_ERR_INVALID_ARG;
+    request->body.clear();
+    request->streaming_body = true;
+    request->streaming_body_length = content_length;
+    return KATHTTP_OK;
+}
+
 void kathttp_request_set_follow_redirects(kathttp_request* request, int enable) {
     if (request) request->follow_redirects = enable ? 1 : 0;
 }

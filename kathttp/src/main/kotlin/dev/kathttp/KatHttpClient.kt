@@ -3,9 +3,13 @@ package dev.kathttp
 import dev.kathttp.internal.NativeBridge
 import dev.kathttp.internal.NativeCallback
 import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.receiveAsFlow
 import java.io.ByteArrayOutputStream
@@ -14,6 +18,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.launch
+import java.io.FileInputStream
 
 class KatHttpClient(private val config: KatHttpClientConfig = KatHttpClientConfig(), applicationContext: android.content.Context? = null) : AutoCloseable {
     private val closed = AtomicBoolean(false)
@@ -43,8 +49,12 @@ class KatHttpClient(private val config: KatHttpClientConfig = KatHttpClientConfi
         val callback = BufferedCallback(id, continuation)
         active += id
         continuation.invokeOnCancellation { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle, id) }; active.remove(id) }
-        val ok = synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle, id, request.method, request.url, request.headers.map { it.name }.toTypedArray(), request.headers.map { it.value }.toTypedArray(), request.body, config.followRedirects, false, callback) }
+        val requestBody = request.streamingBody
+        val bytes = (requestBody as? KatHttpRequestBody.Bytes)?.value ?: request.body
+        val streamingLength = when (requestBody) { is KatHttpRequestBody.FileBody -> requestBody.file.length(); is KatHttpRequestBody.Stream -> requestBody.contentLength ?: -1L; else -> -1L }
+        val ok = synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle, id, request.method, request.url, request.headers.map { it.name }.toTypedArray(), request.headers.map { it.value }.toTypedArray(), bytes, config.followRedirects, false, requestBody != null && requestBody !is KatHttpRequestBody.Bytes, streamingLength, callback) }
         if (!ok) callback.fail(KathttpException.Native(-7))
+        else if (requestBody != null && requestBody !is KatHttpRequestBody.Bytes) startBodyProducer(id, requestBody, callback::fail)
     }
 
     fun executeStreaming(request: KatHttpRequest): KatHttpCall {
@@ -93,8 +103,43 @@ class KatHttpClient(private val config: KatHttpClientConfig = KatHttpClientConfi
             fun cancel() { synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle,id) }; onError(-6) }
         }
         active += id
-        if (!synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle,id,request.method,request.url,request.headers.map{it.name}.toTypedArray(),request.headers.map{it.value}.toTypedArray(),request.body,config.followRedirects,true,callback) }) callback.onError(-7)
+        val requestBody = request.streamingBody
+        val bytes = (requestBody as? KatHttpRequestBody.Bytes)?.value ?: request.body
+        val streamingLength = when (requestBody) { is KatHttpRequestBody.FileBody -> requestBody.file.length(); is KatHttpRequestBody.Stream -> requestBody.contentLength ?: -1L; else -> -1L }
+        if (!synchronized(nativeLock) { if (closed.get()) false else NativeBridge.execute(handle,id,request.method,request.url,request.headers.map{it.name}.toTypedArray(),request.headers.map{it.value}.toTypedArray(),bytes,config.followRedirects,true,requestBody != null && requestBody !is KatHttpRequestBody.Bytes,streamingLength,callback) }) callback.onError(-7)
+        else if (requestBody != null && requestBody !is KatHttpRequestBody.Bytes) startBodyProducer(id, requestBody) { callback.onError(-14) }
         return call
+    }
+
+    private fun startBodyProducer(id: Long, body: KatHttpRequestBody, onFailure: (Throwable) -> Unit) {
+        val source: Flow<ByteArray> = when (body) {
+            is KatHttpRequestBody.FileBody -> flow {
+                FileInputStream(body.file).use { input ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) { val read = input.read(buffer); if (read < 0) break; if (read > 0) emit(buffer.copyOf(read)) }
+                }
+            }
+            is KatHttpRequestBody.Stream -> body.source
+            is KatHttpRequestBody.Bytes -> return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                source.collect { chunk ->
+                    require(chunk.isNotEmpty()) { "Streaming request body must not emit empty chunks" }
+                    while (true) {
+                        val result = NativeBridge.appendRequestBody(handle, id, chunk, false)
+                        if (result == 0) break
+                        if (result != -12) throw KathttpException.Native(result)
+                        delay(5)
+                    }
+                }
+                val result = NativeBridge.appendRequestBody(handle, id, null, true)
+                if (result != 0) throw KathttpException.Native(result)
+            } catch (t: Throwable) {
+                synchronized(nativeLock) { if (!closed.get()) NativeBridge.cancel(handle, id) }
+                onFailure(t)
+            }
+        }
     }
 
     private class InterceptorChainImpl(

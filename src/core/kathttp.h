@@ -194,6 +194,10 @@ KATHTTP_API void kathttp_request_destroy(kathttp_request* request);
 KATHTTP_API int kathttp_request_add_header(kathttp_request* request, const char* name,
                                            const char* value);
 KATHTTP_API int kathttp_request_set_body(kathttp_request* request, const uint8_t* data, size_t len);
+/* Switches a request to producer-fed body mode. content_length is -1 when
+ * unknown. Chunks are appended after execute with client_request_body_append. */
+KATHTTP_API int kathttp_request_set_streaming_body(kathttp_request* request,
+                                                   int64_t content_length);
 KATHTTP_API void kathttp_request_set_follow_redirects(kathttp_request* request, int enable);
 KATHTTP_API void kathttp_request_set_streaming(kathttp_request* request, int enable);
 
@@ -224,6 +228,10 @@ KATHTTP_API void kathttp_client_consume(kathttp_client* client, int64_t request_
  * delivered to this request and has not already been consumed. */
 KATHTTP_API kathttp_error kathttp_client_consume_body(kathttp_client* client, int64_t request_id,
                                                       size_t bytes);
+KATHTTP_API kathttp_error kathttp_client_request_body_append(kathttp_client* client,
+                                                             int64_t request_id,
+                                                             const uint8_t* data, size_t len,
+                                                             int finished);
 
 #ifdef __cplusplus
 }

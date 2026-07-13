@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,7 +46,12 @@ struct Job {
     bool saw_headers = false;
     uint8_t status_field_count = 0;
     bool saw_regular_response_header = false;
-    size_t body_sent = 0;      /* request body bytes already offered to nghttp3 */
+    size_t body_sent = 0; /* request body bytes already offered to nghttp3 */
+    std::mutex request_body_mutex;
+    std::deque<std::vector<uint8_t>> request_body_chunks;
+    size_t request_body_chunk_offset = 0;
+    size_t request_body_buffered_bytes = 0;
+    bool request_body_finished = false;
     uint64_t submitted_at = 0; /* monotonic timestamp; 0 until queued */
     uint64_t response_headers_at = 0;
     uint64_t last_read_progress_at = 0;
@@ -134,6 +140,7 @@ class QuicClient {
      * were consumed by the application; the window extension is applied on the
      * worker thread. Looks up the job's stream id from `request_id`. */
     int consume(int64_t request_id, size_t bytes);
+    int append_request_body(int64_t request_id, const uint8_t* data, size_t len, bool finished);
 
     /* Invoked by ngtcp2/nghttp3 C callbacks (defined as free functions in
      * quic_client.cc / http3_session.cc). Public so those callbacks can reach

@@ -15,6 +15,8 @@ struct kathttp_request {
     std::string url;
     kathttp::HeaderList headers;
     std::vector<uint8_t> body;
+    bool streaming_body = false;
+    int64_t streaming_body_length = -1; /* -1 = unknown */
     int follow_redirects = 1;
     int streaming = 0; /* 1 = streaming (Flow) request: apply HTTP/3
                          receive flow-control (window extended only as

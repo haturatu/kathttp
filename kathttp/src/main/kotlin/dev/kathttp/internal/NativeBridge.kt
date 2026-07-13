@@ -17,8 +17,9 @@ internal object NativeBridge {
         resolver: DnsResolver?): Long
     external fun closeClient(handle: Long)
     external fun destroyClient(handle: Long)
-    external fun execute(handle: Long, id: Long, method: String, url: String, names: Array<String>, values: Array<String>, body: ByteArray?, followRedirects: Boolean, streaming: Boolean, callback: NativeCallback): Boolean
+    external fun execute(handle: Long, id: Long, method: String, url: String, names: Array<String>, values: Array<String>, body: ByteArray?, followRedirects: Boolean, streaming: Boolean, streamingRequestBody: Boolean, streamingContentLength: Long, callback: NativeCallback): Boolean
     external fun consume(handle: Long, id: Long, bytes: Long): Boolean
+    external fun appendRequestBody(handle: Long, id: Long, data: ByteArray?, finished: Boolean): Int
     external fun cancel(handle: Long, id: Long)
     external fun networkChanged(handle: Long, generation: Long)
 }
