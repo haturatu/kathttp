@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly ANDROID_API=26
-readonly BUILD_RECIPE_VERSION=3
+readonly BUILD_RECIPE_VERSION=4
 readonly ANDROID_CMAKE_VERSION=3.22.1
 readonly ANDROID_CMAKE_ARCHIVE_URL="https://dl.google.com/android/repository/cmake-3.22.1-linux.zip"
 readonly ANDROID_CMAKE_ARCHIVE_SHA256="9196644852a978012caf7a4067ba1898debf6cc204c3341562771e31080d6869"
@@ -288,6 +288,11 @@ if ((needs_build)); then
   BORINGSSL_SRC="$(checkout_source boringssl https://boringssl.googlesource.com/boringssl "${BORINGSSL_REVISION}")"
   NGHTTP3_SRC="$(checkout_source nghttp3 https://github.com/ngtcp2/nghttp3.git "${NGHTTP3_VERSION}")"
   NGTCP2_SRC="$(checkout_source ngtcp2 https://github.com/ngtcp2/ngtcp2.git "${NGTCP2_VERSION}")"
+  # ngtcp2 may receive a late packet for a discarded encryption level.  Its
+  # BoringSSL backend must reject a missing native crypto context instead of
+  # dereferencing it in EVP_AEAD_CTX_open.
+  git -C "${NGTCP2_SRC}" apply --check "${ROOT_DIR}/third_party/patches/ngtcp2-boringssl-null-crypto-context.patch"
+  git -C "${NGTCP2_SRC}" apply "${ROOT_DIR}/third_party/patches/ngtcp2-boringssl-null-crypto-context.patch"
 fi
 
 build_or_skip_abi() {
