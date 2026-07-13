@@ -29,6 +29,7 @@ namespace kathttp {
 
 class Engine;
 class Http3Session;
+struct HandshakeCandidate;
 
 enum class ConnectionState { Connecting, Active, Draining, Closing, Closed };
 
@@ -166,6 +167,13 @@ class QuicClient {
     bool has_live_pending_job();
     bool connect_to_endpoint();
     bool setup_connection();
+    /* Run the first IPv6 and IPv4 candidates as independent QUIC/TLS
+     * handshakes.  No request stream is opened until one candidate has
+     * completed its cryptographic handshake, so non-idempotent requests are
+     * never duplicated by the race. */
+    bool run_handshake_race();
+    bool start_handshake_candidate(const ResolvedEndpoint& endpoint);
+    bool adopt_handshake_winner(HandshakeCandidate& candidate);
     void run();
     int event_loop();
     int compute_timeout(uint64_t now);
@@ -217,6 +225,12 @@ class QuicClient {
     sockaddr_storage local_addr_{};
     sockaddr_storage remote_addr_{};
 
+    /* A winner remains alive for the connection lifetime because BoringSSL's
+     * ngtcp2 glue stores a pointer to its conn_ref in the SSL object.  These
+     * declarations intentionally precede tls_session_: C++ destroys members
+     * in reverse order, keeping conn_ref alive through SSL_free. */
+    std::vector<std::unique_ptr<HandshakeCandidate>> handshake_candidates_;
+    std::unique_ptr<HandshakeCandidate> handshake_winner_;
     TlsClientSession tls_session_;
     std::unique_ptr<Http3Session> http3_;
 

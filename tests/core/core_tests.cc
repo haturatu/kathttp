@@ -84,6 +84,14 @@ int main() {
         assert(dns_ready.wait_for(lock, std::chrono::seconds(1), [&] { return dns_done; }));
     }
     assert(endpoints.size() == 2 && endpoints.front().family == AF_INET6);
+    const HappyEyeballsPlan v6_primary = make_happy_eyeballs_plan(endpoints);
+    assert(v6_primary.enabled() && v6_primary.primary == 0 && v6_primary.fallback == 1);
+    std::vector<ResolvedEndpoint> v4_primary{
+        {"192.0.2.2", 443, AF_INET}, {"2001:db8::2", 443, AF_INET6}, {"192.0.2.3", 443, AF_INET}};
+    const HappyEyeballsPlan v4_plan = make_happy_eyeballs_plan(v4_primary);
+    assert(v4_plan.enabled() && v4_plan.primary == 0 && v4_plan.fallback == 1);
+    assert(!make_happy_eyeballs_plan({v4_primary.front()}).enabled());
+    assert(!make_happy_eyeballs_plan({{"invalid", 443, 0}, v4_primary.front()}).enabled());
 
     DnsCache cache(1, 1000, 1000);
     cache.put_success("one.test", 443, 1, endpoints);

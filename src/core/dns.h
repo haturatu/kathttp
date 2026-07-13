@@ -2,6 +2,7 @@
 #define KATHTTP_DNS_H
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <list>
@@ -17,6 +18,20 @@ struct ResolvedEndpoint {
     uint16_t port = 0;
     int family = 0; /* AF_INET / AF_INET6 */
 };
+
+/* The first two independently-startable address candidates.  The primary
+ * preserves resolver ordering; fallback is the first address in the other
+ * family and is scheduled after the Happy Eyeballs delay. */
+struct HappyEyeballsPlan {
+    size_t primary = static_cast<size_t>(-1);
+    size_t fallback = static_cast<size_t>(-1);
+
+    bool enabled() const {
+        return primary != static_cast<size_t>(-1) && fallback != static_cast<size_t>(-1);
+    }
+};
+
+HappyEyeballsPlan make_happy_eyeballs_plan(const std::vector<ResolvedEndpoint>& endpoints);
 
 /* Pluggable name resolution. resolve() runs on the QUIC worker thread;
  * `stop` (when non-null) lets a long/blocking resolution abort when the

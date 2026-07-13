@@ -21,6 +21,8 @@ class UdpSocket {
 
     UdpSocket(const UdpSocket&) = delete;
     UdpSocket& operator=(const UdpSocket&) = delete;
+    UdpSocket(UdpSocket&& other) noexcept;
+    UdpSocket& operator=(UdpSocket&& other) noexcept;
 
     /* Create a socket for the given address family (AF_INET/AF_INET6). */
     bool open(int family);
