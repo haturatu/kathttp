@@ -1,6 +1,6 @@
 # KatHttp3
 
-KatHttp3 is an experimental HTTP/3 client for Android (API 26+) with a C++20 core, stable C ABI, JNI bridge, coroutine Kotlin API, and a Jetpack Compose example. The transport stack is `ngtcp2 1.24.0 + nghttp3 1.17.0 + BoringSSL`.
+KatHttp3 is an independent, native HTTP/3 client library for Android (API 26+) that does not depend on Cronet. It ships its own C++20 core built directly on `ngtcp2 1.24.0 + nghttp3 1.17.0 + BoringSSL`, exposed through a stable C ABI, a JNI bridge, and a coroutine-based Kotlin API, with a Jetpack Compose example.
 
 > Status: host core tests and Android library/example builds are automated. The
 > repository does not include a local HTTP/3-server integration test, so
