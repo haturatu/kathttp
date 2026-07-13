@@ -29,6 +29,37 @@
 
 namespace kathttp {
 
+/* A pre-HTTP/3 connection attempt.  Each candidate owns every object which
+ * carries peer-specific state: UDP fd, ngtcp2 connection, TLS SSL object and
+ * path addresses.  This is deliberately separate from QuicClient so an IPv4
+ * fallback cannot overwrite an IPv6 handshake in flight. */
+struct HandshakeCandidate {
+    explicit HandshakeCandidate(QuicClient* owner_in, ResolvedEndpoint endpoint_in)
+        : owner(owner_in), endpoint(std::move(endpoint_in)) {}
+
+    ~HandshakeCandidate() {
+        if (owns_connection && conn) ngtcp2_conn_del(conn);
+    }
+
+    HandshakeCandidate(const HandshakeCandidate&) = delete;
+    HandshakeCandidate& operator=(const HandshakeCandidate&) = delete;
+
+    QuicClient* owner;
+    ResolvedEndpoint endpoint;
+    UdpSocket sock;
+    ngtcp2_conn* conn = nullptr;
+    ngtcp2_crypto_conn_ref conn_ref{};
+    TlsClientSession tls;
+    ngtcp2_path path{};
+    sockaddr_storage local_addr{};
+    sockaddr_storage remote_addr{};
+    uint64_t started_at = 0;
+    bool handshake_completed = false;
+    bool handshake_confirmed = false;
+    bool failed = false;
+    bool owns_connection = true;
+};
+
 namespace {
 
 uint64_t now_ns() {
@@ -262,6 +293,152 @@ constexpr ngtcp2_callbacks kCallbacks = {
     .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
 };
 
+ngtcp2_conn* candidate_get_conn_cb(ngtcp2_crypto_conn_ref* ref) {
+    return static_cast<HandshakeCandidate*>(ref->user_data)->conn;
+}
+
+HandshakeCandidate* candidate_from(void* user_data) {
+    return static_cast<HandshakeCandidate*>(user_data);
+}
+
+int candidate_recv_crypto_data_cb(ngtcp2_conn* conn, ngtcp2_encryption_level level, uint64_t offset,
+                                  const uint8_t* data, size_t datalen, void* user_data) {
+    int rv = ngtcp2_crypto_recv_crypto_data_cb(conn, level, offset, data, datalen, user_data);
+    if (rv != 0) {
+        auto* candidate = candidate_from(user_data);
+        SSL* ssl = static_cast<SSL*>(ngtcp2_conn_get_tls_native_handle2(conn));
+        if (ssl) candidate->owner->captureTlsError(ssl, rv);
+        candidate->failed = true;
+    }
+    return rv;
+}
+
+int candidate_handshake_completed_cb(ngtcp2_conn*, void* user_data) {
+    candidate_from(user_data)->handshake_completed = true;
+    return 0;
+}
+
+int candidate_handshake_confirmed_cb(ngtcp2_conn*, void* user_data) {
+    auto* candidate = candidate_from(user_data);
+    candidate->handshake_confirmed = true;
+    candidate->owner->on_handshake_confirmed();
+    return 0;
+}
+
+int candidate_recv_rx_key_cb(ngtcp2_conn*, ngtcp2_encryption_level level, void* user_data) {
+    if (level == NGTCP2_ENCRYPTION_LEVEL_1RTT) {
+        candidate_from(user_data)->handshake_completed = true;
+    }
+    return 0;
+}
+
+int candidate_recv_stream_data_cb(ngtcp2_conn*, uint32_t flags, int64_t stream_id, uint64_t,
+                                  const uint8_t* data, size_t datalen, void* user_data, void*) {
+    return candidate_from(user_data)->owner->on_recv_stream_data(flags, stream_id, data, datalen)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_acked_stream_data_cb(ngtcp2_conn*, int64_t stream_id, uint64_t, uint64_t datalen,
+                                   void* user_data, void*) {
+    return candidate_from(user_data)->owner->on_acked_stream_data(stream_id, datalen)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_stream_close_cb(ngtcp2_conn*, uint32_t, int64_t stream_id, uint64_t app_error,
+                              void* user_data, void*) {
+    return candidate_from(user_data)->owner->on_stream_close(stream_id, app_error)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_stream_reset_cb(ngtcp2_conn*, int64_t stream_id, uint64_t, uint64_t app_error,
+                              void* user_data, void*) {
+    return candidate_from(user_data)->owner->on_stream_reset(stream_id, app_error)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_stream_stop_sending_cb(ngtcp2_conn*, int64_t stream_id, uint64_t app_error,
+                                     void* user_data, void*) {
+    return candidate_from(user_data)->owner->on_stream_stop_sending(stream_id, app_error)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_extend_max_stream_data_cb(ngtcp2_conn*, int64_t stream_id, uint64_t, void* user_data,
+                                        void*) {
+    return candidate_from(user_data)->owner->on_extend_max_stream_data(stream_id)
+               ? 0
+               : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int candidate_extend_max_streams_bidi_cb(ngtcp2_conn*, uint64_t, void* user_data) {
+    candidate_from(user_data)->owner->try_submit_pending();
+    return 0;
+}
+
+int candidate_get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token, size_t cidlen,
+                                       void* user_data) {
+    auto* owner = candidate_from(user_data)->owner;
+    if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
+    cid->datalen = cidlen;
+    owner->generate_reset_token(token, cid);
+    return 0;
+}
+
+int candidate_get_new_connection_id2_cb(ngtcp2_conn*, ngtcp2_cid* cid,
+                                        ngtcp2_stateless_reset_token* token, size_t cidlen,
+                                        void* user_data) {
+    return candidate_get_new_connection_id_cb(nullptr, cid, token->data, cidlen, user_data);
+}
+
+int candidate_early_data_rejected_cb(ngtcp2_conn*, void* user_data) {
+    candidate_from(user_data)->owner->on_early_data_rejected();
+    return 0;
+}
+
+constexpr ngtcp2_callbacks kCandidateCallbacks = {
+    .client_initial = ngtcp2_crypto_client_initial_cb,
+    .recv_crypto_data = candidate_recv_crypto_data_cb,
+    .handshake_completed = candidate_handshake_completed_cb,
+    .recv_version_negotiation = version_negotiation_cb,
+    .encrypt = ngtcp2_crypto_encrypt_cb,
+    .decrypt = ngtcp2_crypto_decrypt_cb,
+    .hp_mask = ngtcp2_crypto_hp_mask_cb,
+    .recv_stream_data = candidate_recv_stream_data_cb,
+    .acked_stream_data_offset = candidate_acked_stream_data_cb,
+    .stream_open = stream_open_cb,
+    .stream_close = candidate_stream_close_cb,
+    .recv_stateless_reset = recv_stateless_reset_cb,
+    .recv_retry = ngtcp2_crypto_recv_retry_cb,
+    .extend_max_local_streams_bidi = candidate_extend_max_streams_bidi_cb,
+    .rand = rand_cb,
+    .get_new_connection_id = candidate_get_new_connection_id_cb,
+    .remove_connection_id = [](ngtcp2_conn*, const ngtcp2_cid*, void*) -> int { return 0; },
+    .update_key = update_key_cb,
+    .path_validation = path_validation_cb,
+    .select_preferred_addr = select_preferred_addr_cb,
+    .stream_reset = candidate_stream_reset_cb,
+    .extend_max_stream_data = candidate_extend_max_stream_data_cb,
+    .handshake_confirmed = candidate_handshake_confirmed_cb,
+    .recv_new_token = recv_new_token_cb,
+    .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
+    .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
+    .recv_datagram = recv_datagram_cb,
+    .ack_datagram = ack_datagram_cb,
+    .lost_datagram = lost_datagram_cb,
+    .stream_stop_sending = candidate_stream_stop_sending_cb,
+    .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
+    .recv_rx_key = candidate_recv_rx_key_cb,
+    .tls_early_data_rejected = candidate_early_data_rejected_cb,
+    .begin_path_validation = begin_path_validation_cb,
+    .recv_stateless_reset2 = recv_stateless_reset2_cb,
+    .get_new_connection_id2 = candidate_get_new_connection_id2_cb,
+    .get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb,
+};
+
 }  // namespace
 
 QuicClient::QuicClient(Engine* engine, TlsClientContext& tls_ctx, const Url& origin,
@@ -491,6 +668,217 @@ bool QuicClient::setup_connection() {
     return true;
 }
 
+bool QuicClient::start_handshake_candidate(const ResolvedEndpoint& endpoint) {
+    auto candidate = std::make_unique<HandshakeCandidate>(this, endpoint);
+    if (!candidate->sock.open(endpoint.family)) return false;
+    candidate->sock.set_nonblocking();
+    if (!candidate->sock.connect(endpoint)) return false;
+
+    ngtcp2_cid scid{}, dcid{};
+    scid.datalen = 8;
+    dcid.datalen = 8;
+    if (RAND_bytes(scid.data, static_cast<int>(scid.datalen)) != 1 ||
+        RAND_bytes(dcid.data, static_cast<int>(dcid.datalen)) != 1) {
+        return false;
+    }
+
+    ngtcp2_settings settings;
+    ngtcp2_settings_default(&settings);
+    candidate->started_at = now_ns();
+    settings.initial_ts = candidate->started_at;
+    settings.handshake_timeout = handshake_timeout_ms_ * NGTCP2_MILLISECONDS;
+
+    ngtcp2_transport_params params;
+    ngtcp2_transport_params_default(&params);
+    params.initial_max_stream_data_bidi_local = 256 * 1024;
+    params.initial_max_stream_data_bidi_remote = 256 * 1024;
+    params.initial_max_data = 16 * 1024 * 1024;
+    params.initial_max_streams_bidi = 16;
+    params.initial_max_streams_uni = 3;
+    params.max_idle_timeout = idle_timeout_ms_ * NGTCP2_MILLISECONDS;
+    params.active_connection_id_limit = 4;
+
+    candidate->path.local.addr = reinterpret_cast<ngtcp2_sockaddr*>(&candidate->local_addr);
+    candidate->path.remote.addr = reinterpret_cast<ngtcp2_sockaddr*>(&candidate->remote_addr);
+    sockaddr_storage address{};
+    socklen_t address_len = sizeof(address);
+    if (getsockname(candidate->sock.fd(), reinterpret_cast<sockaddr*>(&address), &address_len) ==
+        0) {
+        std::memcpy(&candidate->local_addr, &address, address_len);
+        candidate->path.local.addrlen = address_len;
+    }
+    address_len = sizeof(address);
+    if (getpeername(candidate->sock.fd(), reinterpret_cast<sockaddr*>(&address), &address_len) ==
+        0) {
+        std::memcpy(&candidate->remote_addr, &address, address_len);
+        candidate->path.remote.addrlen = address_len;
+    }
+
+    int rv = ngtcp2_conn_client_new_versioned(
+        &candidate->conn, &dcid, &scid, &candidate->path,
+        quic_version_ ? quic_version_ : NGTCP2_PROTO_VER_V1, NGTCP2_CALLBACKS_VERSION,
+        &kCandidateCallbacks, NGTCP2_SETTINGS_VERSION, &settings, NGTCP2_TRANSPORT_PARAMS_VERSION,
+        &params, nullptr, candidate.get());
+    if (rv != 0) {
+        KATHTTP_LOG_ERR("ngtcp2_conn_client_new (Happy Eyeballs): %s\n", ngtcp2_strerror(rv));
+        return false;
+    }
+    candidate->conn_ref.get_conn = candidate_get_conn_cb;
+    candidate->conn_ref.user_data = candidate.get();
+    if (!candidate->tls.init(tls_ctx_, origin_.host, enable_0rtt_, &candidate->conn_ref))
+        return false;
+    ngtcp2_conn_set_tls_native_handle(candidate->conn, candidate->tls.native());
+    handshake_candidates_.push_back(std::move(candidate));
+    return true;
+}
+
+bool QuicClient::adopt_handshake_winner(HandshakeCandidate& candidate) {
+    if (!candidate.conn || !candidate.handshake_completed) return false;
+
+    /* The callbacks and the SSL conn_ref deliberately continue to point at
+     * this candidate.  It is moved into handshake_winner_ below and retained
+     * until this QuicClient is destroyed. */
+    conn_ = candidate.conn;
+    candidate.owns_connection = false;
+    sock_ = std::move(candidate.sock);
+    tls_session_ = std::move(candidate.tls);
+    std::memcpy(&local_addr_, &candidate.local_addr, sizeof(local_addr_));
+    std::memcpy(&remote_addr_, &candidate.remote_addr, sizeof(remote_addr_));
+    path_ = candidate.path;
+    path_.local.addr = reinterpret_cast<ngtcp2_sockaddr*>(&local_addr_);
+    path_.remote.addr = reinterpret_cast<ngtcp2_sockaddr*>(&remote_addr_);
+    handshake_started_at_ = candidate.started_at;
+    http3_ = std::make_unique<Http3Session>(this, conn_);
+    http3_ready_ = false;
+    handshake_confirmed_.store(candidate.handshake_confirmed);
+    state_.store(candidate.handshake_confirmed ? ConnectionState::Active
+                                               : ConnectionState::Connecting);
+    on_handshake_completed();
+
+    for (auto& attempt : handshake_candidates_) {
+        if (attempt.get() == &candidate) {
+            handshake_winner_ = std::move(attempt);
+        } else if (attempt) {
+            /* No request stream is ever created on a loser.  Closing its UDP
+             * fd and destroying ngtcp2 makes the cancellation immediate and
+             * prevents a late packet from becoming observable by the winner. */
+            attempt->sock.close();
+            attempt.reset();
+        }
+    }
+    handshake_candidates_.clear();
+    KATHTTP_LOG_ERR("Happy Eyeballs selected %s (%s) after QUIC handshake\n",
+                    candidate.endpoint.ip.c_str(),
+                    candidate.endpoint.family == AF_INET6 ? "IPv6" : "IPv4");
+    return true;
+}
+
+bool QuicClient::run_handshake_race() {
+    constexpr uint64_t kFamilyFallbackDelayNs = 250 * NGTCP2_MILLISECONDS;
+    const HappyEyeballsPlan plan = make_happy_eyeballs_plan(endpoints_);
+    if (!plan.enabled()) return false;
+    if (!start_handshake_candidate(endpoints_[plan.primary])) return false;
+    const uint64_t race_started = now_ns();
+    bool fallback_started = false;
+
+    auto write_candidate = [](HandshakeCandidate& candidate, uint64_t now) -> bool {
+        uint8_t packet[NGTCP2_MAX_PKTLEN];
+        for (;;) {
+            ngtcp2_pkt_info info{};
+            ngtcp2_ssize n = ngtcp2_conn_write_pkt_versioned(candidate.conn, &candidate.path,
+                                                             NGTCP2_PKT_INFO_VERSION, &info, packet,
+                                                             sizeof(packet), now);
+            if (n == NGTCP2_ERR_WRITE_MORE) continue;
+            if (n < 0) return false;
+            if (n == 0) return true;
+            if (candidate.sock.send(packet, static_cast<size_t>(n), info.ecn) < 0) return false;
+        }
+    };
+
+    while (!stop_.load(std::memory_order_acquire)) {
+        const uint64_t now = now_ns();
+        if (!fallback_started && (now - race_started >= kFamilyFallbackDelayNs ||
+                                  handshake_candidates_.front()->failed)) {
+            fallback_started = true;
+            if (!start_handshake_candidate(endpoints_[plan.fallback])) {
+                terminal_error_ = KATHTTP_ERR_QUIC;
+            }
+        }
+        for (auto& candidate : handshake_candidates_) {
+            if (candidate && candidate->handshake_completed)
+                return adopt_handshake_winner(*candidate);
+        }
+        if (connect_timeout_ms_ != 0 &&
+            now - connection_started_at_ >= connect_timeout_ms_ * NGTCP2_MILLISECONDS) {
+            terminal_error_ = KATHTTP_ERR_CONNECT_TIMEOUT;
+            return false;
+        }
+
+        std::vector<pollfd> fds;
+        std::vector<HandshakeCandidate*> polled;
+        for (auto& candidate : handshake_candidates_) {
+            if (!candidate || candidate->failed || !candidate->conn) continue;
+            fds.push_back(
+                {candidate->sock.fd(),
+                 static_cast<short>(POLLIN | (candidate->sock.wants_write() ? POLLOUT : 0)), 0});
+            polled.push_back(candidate.get());
+        }
+        if (fds.empty() && fallback_started) {
+            terminal_error_ = KATHTTP_ERR_QUIC;
+            return false;
+        }
+        int timeout_ms = 10;
+        if (!fallback_started) {
+            uint64_t remaining =
+                kFamilyFallbackDelayNs - std::min(now - race_started, kFamilyFallbackDelayNs);
+            timeout_ms = static_cast<int>(std::min<uint64_t>(remaining / NGTCP2_MILLISECONDS, 10));
+        }
+        if (!fds.empty() && poll(fds.data(), fds.size(), timeout_ms) < 0 && errno != EINTR) {
+            terminal_error_ = KATHTTP_ERR_QUIC;
+            return false;
+        }
+        const uint64_t progressed_at = now_ns();
+        for (size_t i = 0; i < polled.size(); ++i) {
+            HandshakeCandidate& candidate = *polled[i];
+            if (fds[i].revents & POLLIN) {
+                for (int packets = 0; packets < 16; ++packets) {
+                    uint8_t packet[NGTCP2_MAX_PKTLEN];
+                    sockaddr_storage from{};
+                    socklen_t fromlen = sizeof(from);
+                    unsigned int ecn = 0;
+                    ssize_t n = candidate.sock.recv(packet, sizeof(packet), from, fromlen, ecn);
+                    if (n <= 0) break;
+                    ngtcp2_pkt_info info{};
+                    info.ecn = static_cast<uint8_t>(ecn);
+                    if (ngtcp2_conn_read_pkt_versioned(
+                            candidate.conn, &candidate.path, NGTCP2_PKT_INFO_VERSION, &info, packet,
+                            static_cast<size_t>(n), progressed_at) != 0) {
+                        candidate.failed = true;
+                        break;
+                    }
+                }
+            }
+            if (!candidate.failed && (fds[i].revents & POLLOUT) &&
+                !candidate.sock.flush_send_queue()) {
+                candidate.failed = true;
+            }
+            if (!candidate.failed &&
+                ngtcp2_conn_handle_expiry(candidate.conn, progressed_at) != 0) {
+                candidate.failed = true;
+            }
+            if (!candidate.failed && !write_candidate(candidate, progressed_at))
+                candidate.failed = true;
+            if (!candidate.failed && handshake_timeout_ms_ != 0 &&
+                progressed_at - candidate.started_at >=
+                    handshake_timeout_ms_ * NGTCP2_MILLISECONDS) {
+                candidate.failed = true;
+                terminal_error_ = KATHTTP_ERR_HANDSHAKE_TIMEOUT;
+            }
+        }
+    }
+    return false;
+}
+
 void QuicClient::run() {
     connection_started_at_ = now_ns();
     if (!prepare_endpoints()) {
@@ -498,6 +886,38 @@ void QuicClient::run() {
         fail_all_pending(terminal_error_ == KATHTTP_ERR_QUIC ? KATHTTP_ERR_DNS : terminal_error_);
         return;
     }
+
+    bool has_ipv4 = false;
+    bool has_ipv6 = false;
+    for (const auto& endpoint : endpoints_) {
+        has_ipv4 = has_ipv4 || endpoint.family == AF_INET;
+        has_ipv6 = has_ipv6 || endpoint.family == AF_INET6;
+    }
+    if (has_ipv4 && has_ipv6) {
+        if (run_handshake_race()) {
+            /* Exactly one candidate owns the connection now.  Requests have
+             * remained pending until this point, so this is safe for POST and
+             * other non-idempotent methods. */
+            const int loop_result = event_loop();
+            if (loop_result != 0 && !stop_.load(std::memory_order_acquire)) {
+                const int tls_error = tls_session_.lastFailure().code;
+                fail_all_pending(tls_error != 0 ? tls_error : KATHTTP_ERR_QUIC);
+            }
+            if (conn_) {
+                ngtcp2_conn_del(conn_);
+                conn_ = nullptr;
+            }
+            sock_.close();
+            closed_.store(true);
+            state_.store(ConnectionState::Closed);
+            return;
+        }
+        /* A race failure may be address-specific.  Release its isolated
+         * attempts and retain the old sequential path as a last-resort
+         * fallback for additional resolver results. */
+        handshake_candidates_.clear();
+    }
+
     while (endpoint_idx_ < endpoints_.size() && !stop_ && !handshake_confirmed_) {
         if (connect_timeout_ms_ != 0 &&
             now_ns() - connection_started_at_ >= connect_timeout_ms_ * NGTCP2_MILLISECONDS) {

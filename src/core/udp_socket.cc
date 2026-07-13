@@ -26,6 +26,33 @@ UdpSocket::~UdpSocket() {
     close();
 }
 
+UdpSocket::UdpSocket(UdpSocket&& other) noexcept
+    : fd_(other.fd_),
+      family_(other.family_),
+      connected_(other.connected_),
+      send_queue_(std::move(other.send_queue_)),
+      queued_bytes_(other.queued_bytes_) {
+    other.fd_ = -1;
+    other.family_ = 0;
+    other.connected_ = false;
+    other.queued_bytes_ = 0;
+}
+
+UdpSocket& UdpSocket::operator=(UdpSocket&& other) noexcept {
+    if (this == &other) return *this;
+    close();
+    fd_ = other.fd_;
+    family_ = other.family_;
+    connected_ = other.connected_;
+    send_queue_ = std::move(other.send_queue_);
+    queued_bytes_ = other.queued_bytes_;
+    other.fd_ = -1;
+    other.family_ = 0;
+    other.connected_ = false;
+    other.queued_bytes_ = 0;
+    return *this;
+}
+
 void UdpSocket::close() {
     send_queue_.clear();
     queued_bytes_ = 0;

@@ -249,10 +249,14 @@ appended only. Symbols are hidden by default except `kathttp_*` exports.
 - Graceful GOAWAY draining, response Content-Length validation, trailer exposure, strict response-field validation and robust packet send backpressure are incomplete.
 - Streaming uses a bounded JNI-to-Kotlin channel but native QUIC flow-control credit is currently returned on callback delivery, not downstream Flow consumption.
 - DNS lookups run in a bounded two-thread resolver pool rather than on a QUIC
-  worker. Cancellation and DNS deadlines discard late results. IPv6 and IPv4
-  records are interleaved in RFC 8305 order; connection attempts are still
-  sequential, so fully parallel, timed Happy Eyeballs racing is not yet
-  provided.
+  worker. Cancellation and DNS deadlines discard late results. When both
+  address families are available, the first resolver-ordered candidate starts
+  a QUIC/TLS handshake immediately and the first opposite-family candidate
+  starts after 250ms (or immediately after the first candidate fails). The
+  handshake winner is selected before any HTTP request stream is opened; the
+  loser socket and QUIC state are released. Additional addresses retain the
+  sequential fallback path. This is a connection-establishment race, not QUIC
+  connection migration.
 - Redirects reject HTTPS-to-HTTP downgrades and strip Authorization,
   Proxy-Authorization, Cookie, and Host on cross-origin hops. The cookie jar
   is experimental and disabled by default (`enableCookies = true` is explicit

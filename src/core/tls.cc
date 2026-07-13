@@ -226,6 +226,31 @@ TlsClientSession::~TlsClientSession() {
     }
 }
 
+TlsClientSession::TlsClientSession(TlsClientSession&& other) noexcept
+    : ssl_(other.ssl_), last_failure_(std::move(other.last_failure_)) {
+    other.ssl_ = nullptr;
+    if (ssl_) {
+        ensure_ex_indices();
+        SSL_set_ex_data(ssl_, g_session_ex_index, this);
+    }
+}
+
+TlsClientSession& TlsClientSession::operator=(TlsClientSession&& other) noexcept {
+    if (this == &other) return *this;
+    if (ssl_) {
+        SSL_set_app_data(ssl_, nullptr);
+        SSL_free(ssl_);
+    }
+    ssl_ = other.ssl_;
+    last_failure_ = std::move(other.last_failure_);
+    other.ssl_ = nullptr;
+    if (ssl_) {
+        ensure_ex_indices();
+        SSL_set_ex_data(ssl_, g_session_ex_index, this);
+    }
+    return *this;
+}
+
 bool TlsClientSession::init(TlsClientContext& ctx, const std::string& server_name,
                             bool enable_early_data, ngtcp2_crypto_conn_ref* conn_ref) {
     ssl_ = SSL_new(ctx.native());

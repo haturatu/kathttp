@@ -63,6 +63,8 @@ class TlsClientSession {
 
     TlsClientSession(const TlsClientSession&) = delete;
     TlsClientSession& operator=(const TlsClientSession&) = delete;
+    TlsClientSession(TlsClientSession&& other) noexcept;
+    TlsClientSession& operator=(TlsClientSession&& other) noexcept;
 
     /* `conn_ref` must outlive the session; it is used by the ngtcp2_crypto
      * callbacks to recover the ngtcp2_conn. */

@@ -89,6 +89,26 @@ DnsWorkerPool& dns_worker_pool() {
 }
 }  // namespace
 
+HappyEyeballsPlan make_happy_eyeballs_plan(const std::vector<ResolvedEndpoint>& endpoints) {
+    HappyEyeballsPlan plan;
+    if (endpoints.empty()) return plan;
+    plan.primary = 0;
+    const int primary_family = endpoints.front().family;
+    if (primary_family != AF_INET && primary_family != AF_INET6) {
+        plan.primary = static_cast<size_t>(-1);
+        return plan;
+    }
+    for (size_t i = 1; i < endpoints.size(); ++i) {
+        if (endpoints[i].family != primary_family &&
+            (endpoints[i].family == AF_INET || endpoints[i].family == AF_INET6)) {
+            plan.fallback = i;
+            return plan;
+        }
+    }
+    plan.primary = static_cast<size_t>(-1);
+    return plan;
+}
+
 namespace {
 uint64_t monotonic_ms() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
