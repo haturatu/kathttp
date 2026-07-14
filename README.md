@@ -297,9 +297,10 @@ appended only. Symbols are hidden by default except `kathttp3_*` exports.
 - UDP transient send failures are queued with fixed packet and byte limits;
   queue overflow is surfaced as a connection failure. There are no public
   queue metrics.
-- Streaming response credit is limited by `maxStreamingBufferedBodyBytes` and
-  is returned by the Kotlin Flow delivery hook. It is not an acknowledgement
-  that arbitrary application work after collection has completed.
+- Streaming response credit is returned when JNI callback data has been copied
+  into KatHttp3's bounded Kotlin buffer, not when a Flow collector later runs.
+  It is therefore not an acknowledgement that arbitrary application work after
+  collection has completed.
 - Kotlin queues are also guarded by byte budgets: configure
   `maxStreamingBufferedBytesPerStream` and
   `maxStreamingBufferedBytesPerConnection` (defaults: 4 MiB and 16 MiB).
