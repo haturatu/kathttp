@@ -114,9 +114,6 @@ class KatHttp3Client(private val config: KatHttp3ClientConfig = KatHttp3ClientCo
             .onEach {
                 if (it is KatHttp3StreamEvent.Body) {
                     release(it.bytes.size)
-                    // Credit is returned only after this Flow element has been
-                    // delivered to the collector, never when native invokes a callback.
-                    NativeBridge.consume(handle, id, it.bytes.size.toLong())
                     drainOneStashedChunk()
                     finishIfDrained()
                 }
@@ -132,12 +129,19 @@ class KatHttp3Client(private val config: KatHttp3ClientConfig = KatHttp3ClientCo
             override fun onHeaders(status: Int, names: Array<String>, values: Array<String>) { if (!channel.trySend(KatHttp3StreamEvent.Headers(status, names.indices.map { KatHttp3Header(names[it], values[it]) })).isSuccess) cancel() }
             override fun onBody(data: ByteArray) {
                 if (!reserve(data.size)) { cancel(); return }
-                if (channel.trySend(KatHttp3StreamEvent.Body(data)).isSuccess) return
+                if (channel.trySend(KatHttp3StreamEvent.Body(data)).isSuccess) {
+                    // JNI has copied the native callback bytes into a Kotlin-owned
+                    // bounded buffer. Return QUIC credit now, independently of
+                    // downstream Flow scheduling or image decoding work.
+                    NativeBridge.consume(handle, id, data.size.toLong())
+                    return
+                }
                 val overflow = synchronized(stashLock) {
                     if (stashedBytes + data.size > config.maxStreamingBufferedBodyBytes) true
                     else { stash.addLast(data); stashedBytes += data.size; false }
                 }
                 if (overflow) { release(data.size); cancel() }
+                else NativeBridge.consume(handle, id, data.size.toLong())
             }
             override fun onComplete() { if (terminal.compareAndSet(false,true)) { active.remove(id); releasePermit(); completePending.set(true); finishIfDrained() } }
             override fun onError(code: Int) { fail(mapError(code)) }
