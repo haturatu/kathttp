@@ -19,6 +19,7 @@
 #include "engine.h"
 #include "flow_control.h"
 #include "handshake_race.h"
+#include "handshake_stream_buffer.h"
 #include "http3_session.h"
 #include "log.h"
 #include "precommit_failover.h"
@@ -117,6 +118,12 @@ struct HandshakeCandidate {
     // This is the race result; vector/poll callback order must not decide it.
     uint64_t one_rtt_ready_at = 0;
     bool handshake_confirmed = false;
+    // A server can send its HTTP/3 control and QPACK streams in the same
+    // packet that makes 1-RTT keys available.  The main HTTP/3 codec does not
+    // exist until this candidate wins, so retain those callbacks and replay
+    // them after adoption instead of rejecting an otherwise healthy path.
+    HandshakeStreamBuffer buffered_stream_data;
+    bool adopted = false;
     bool abandoned = false;
     bool failed = false;
     bool owns_connection = true;
@@ -418,11 +425,20 @@ int candidate_recv_rx_key_cb(ngtcp2_conn*, ngtcp2_encryption_level level, void* 
     return 0;
 }
 
-int candidate_recv_stream_data_cb(ngtcp2_conn*, uint32_t flags, int64_t stream_id, uint64_t,
+int candidate_recv_stream_data_cb(ngtcp2_conn*, uint32_t flags, int64_t stream_id, uint64_t offset,
                                   const uint8_t* data, size_t datalen, void* user_data, void*) {
-    return candidate_from(user_data)->owner->on_recv_stream_data(flags, stream_id, data, datalen)
-               ? 0
-               : NGTCP2_ERR_CALLBACK_FAILURE;
+    auto* candidate = candidate_from(user_data);
+    if (candidate->abandoned) return 0;
+    if (candidate->adopted) {
+        return candidate->owner->on_recv_stream_data(flags, stream_id, data, datalen)
+                   ? 0
+                   : NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    if (!candidate->buffered_stream_data.append(flags, stream_id, offset, data, datalen)) {
+        candidate->failed = true;
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    return 0;
 }
 
 int candidate_acked_stream_data_cb(ngtcp2_conn*, int64_t stream_id, uint64_t, uint64_t datalen,
@@ -946,8 +962,6 @@ bool QuicClient::adopt_handshake_winner(HandshakeCandidate& candidate) {
      * this candidate.  It is moved into handshake_winner_ below and retained
      * until this QuicClient is destroyed. */
     conn_ = candidate.conn;
-    candidate.owns_connection = false;
-    sock_ = std::move(candidate.sock);
     peer_endpoint_ = candidate.endpoint;
     tls_session_ = std::move(candidate.tls);
     std::memcpy(&local_addr_, &candidate.local_addr, sizeof(local_addr_));
@@ -965,7 +979,30 @@ bool QuicClient::adopt_handshake_winner(HandshakeCandidate& candidate) {
     http3_ready_ = false;
     handshake_confirmed_.store(false);
     state_.store(ConnectionState::Connecting);
-    on_handshake_completed();
+    if (!on_handshake_completed()) {
+        http3_.reset();
+        candidate.tls = std::move(tls_session_);
+        conn_ = nullptr;
+        candidate.failed = true;
+        terminal_error_ = KATHTTP3_ERR_HTTP3;
+        return false;
+    }
+    candidate.adopted = true;
+    for (const auto& buffered : candidate.buffered_stream_data.events()) {
+        const uint8_t* data = buffered.data.empty() ? nullptr : buffered.data.data();
+        if (!on_recv_stream_data(buffered.flags, buffered.stream_id, data, buffered.data.size())) {
+            candidate.adopted = false;
+            http3_.reset();
+            candidate.tls = std::move(tls_session_);
+            conn_ = nullptr;
+            candidate.failed = true;
+            terminal_error_ = KATHTTP3_ERR_HTTP3;
+            return false;
+        }
+    }
+    candidate.buffered_stream_data.clear();
+    candidate.owns_connection = false;
+    sock_ = std::move(candidate.sock);
     if (candidate.handshake_confirmed) on_handshake_confirmed();
 
     for (auto& attempt : handshake_candidates_) {
