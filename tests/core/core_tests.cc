@@ -12,6 +12,7 @@
 #include "dns.h"
 #include "flow_control.h"
 #include "handshake_race.h"
+#include "handshake_stream_buffer.h"
 #include "header_list.h"
 #include "precommit_failover.h"
 #include "redirect.h"
@@ -131,6 +132,26 @@ int main() {
     assert(request_body_can_advance(4, 6, 10));
     assert(!request_body_can_advance(4, 7, 10));
     assert(request_body_next_chunk_size(kMaxHttp3DataReaderBytes + 1) == kMaxHttp3DataReaderBytes);
+
+    HandshakeStreamBuffer handshake_stream_buffer;
+    const uint8_t settings[] = {0x00, 0x04, 0x00};
+    const bool buffered_settings =
+        handshake_stream_buffer.append(0, 3, 0, settings, sizeof(settings));
+    assert(buffered_settings);
+    const bool buffered_qpack_fin = handshake_stream_buffer.append(1, 7, 0, nullptr, 0);
+    assert(buffered_qpack_fin);
+    assert(handshake_stream_buffer.buffered_bytes() == sizeof(settings));
+    assert(handshake_stream_buffer.events().size() == 2);
+    assert(handshake_stream_buffer.events()[0].stream_id == 3);
+    assert(handshake_stream_buffer.events()[0].data[1] == 0x04);
+    assert(handshake_stream_buffer.events()[1].stream_id == 7);
+    std::vector<uint8_t> oversized_handshake_data(HandshakeStreamBuffer::kMaxBytes + 1);
+    const bool rejected_oversized_handshake_data = handshake_stream_buffer.append(
+        0, 11, 0, oversized_handshake_data.data(), oversized_handshake_data.size());
+    assert(!rejected_oversized_handshake_data);
+    handshake_stream_buffer.clear();
+    assert(handshake_stream_buffer.events().empty());
+    assert(handshake_stream_buffer.buffered_bytes() == 0);
 
     // Local streaming backpressure is not a peer read-idle failure.
     assert(!receive_credit_blocked_by_consumer(0, 0));
