@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstring>
 
@@ -141,8 +142,15 @@ ngtcp2_conn* get_conn_cb(ngtcp2_crypto_conn_ref* ref) {
     return static_cast<QuicClient*>(ref->user_data)->conn();
 }
 
-void rand_cb(uint8_t* dest, size_t destlen, const ngtcp2_rand_ctx*) {
-    RAND_bytes(dest, static_cast<int>(destlen));
+void rand_cb(uint8_t* dest, size_t destlen, const ngtcp2_rand_ctx* random_context) {
+    if (!dest || destlen > static_cast<size_t>(INT_MAX) ||
+        RAND_bytes(dest, static_cast<int>(destlen)) != 1) {
+        if (dest) std::memset(dest, 0, destlen);
+        if (random_context && random_context->native_handle) {
+            static_cast<std::atomic<bool>*>(random_context->native_handle)
+                ->store(true, std::memory_order_release);
+        }
+    }
 }
 
 void write_qlog_fd(int fd, uint32_t /*flags*/, const void* data, size_t len) {
@@ -171,8 +179,7 @@ int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* token, size
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     cid->datalen = cidlen;
-    c->generate_reset_token(token, cid);
-    return 0;
+    return c->generate_reset_token(token, cid) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 int get_new_connection_id2_cb(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_reset_token* token,
@@ -182,8 +189,7 @@ int get_new_connection_id2_cb(ngtcp2_conn*, ngtcp2_cid* cid, ngtcp2_stateless_re
         return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     cid->datalen = cidlen;
-    c->generate_reset_token(token->data, cid);
-    return 0;
+    return c->generate_reset_token(token->data, cid) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 int recv_crypto_data_cb(ngtcp2_conn* conn, ngtcp2_encryption_level level, uint64_t offset,
@@ -265,13 +271,6 @@ int extend_max_stream_data_cb(ngtcp2_conn*, int64_t stream_id, uint64_t, void* u
     return static_cast<QuicClient*>(user_data)->on_extend_max_stream_data(stream_id) ? 0 : -1;
 }
 
-int update_key_cb(ngtcp2_conn*, uint8_t*, uint8_t*, ngtcp2_crypto_aead_ctx*, uint8_t*,
-                  ngtcp2_crypto_aead_ctx*, uint8_t*, const uint8_t*, const uint8_t*, size_t,
-                  void* user_data) {
-    (void)user_data;
-    return 0;
-}
-
 int path_validation_cb(ngtcp2_conn*, uint32_t, const ngtcp2_path*, const ngtcp2_path*,
                        ngtcp2_path_validation_result result, void* user_data) {
     static_cast<QuicClient*>(user_data)->on_path_validation(result);
@@ -283,19 +282,14 @@ int candidate_path_validation_cb(ngtcp2_conn*, uint32_t, const ngtcp2_path*, con
     return 0;
 }
 
-int select_preferred_addr_cb(ngtcp2_conn*, ngtcp2_path*, const ngtcp2_preferred_addr*,
-                             void* user_data) {
-    (void)user_data;
-    return 0;
-}
-
 int early_data_rejected_cb(ngtcp2_conn*, void* user_data) {
     static_cast<QuicClient*>(user_data)->on_early_data_rejected();
     return 0;
 }
 
-int recv_new_token_cb(ngtcp2_conn*, const uint8_t*, size_t, void* user_data) {
-    (void)user_data;
+int recv_new_token_cb(ngtcp2_conn*, const uint8_t* token, size_t tokenlen, void* user_data) {
+    auto* client = static_cast<QuicClient*>(user_data);
+    client->cache_new_token(token, tokenlen, client->peer_family());
     return 0;
 }
 
@@ -366,9 +360,9 @@ constexpr ngtcp2_callbacks kCallbacks = {
     .rand = rand_cb,
     .get_new_connection_id = get_new_connection_id_cb,
     .remove_connection_id = [](ngtcp2_conn*, const ngtcp2_cid*, void*) -> int { return 0; },
-    .update_key = update_key_cb,
+    .update_key = ngtcp2_crypto_update_key_cb,
     .path_validation = path_validation_cb,
-    .select_preferred_addr = select_preferred_addr_cb,
+    .select_preferred_addr = nullptr,
     .stream_reset = stream_reset_cb,
     .extend_max_stream_data = extend_max_stream_data_cb,
     .handshake_confirmed = handshake_confirmed_cb,
@@ -492,8 +486,7 @@ int candidate_get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid, uint8_t* t
     auto* owner = candidate_from(user_data)->owner;
     if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) return NGTCP2_ERR_CALLBACK_FAILURE;
     cid->datalen = cidlen;
-    owner->generate_reset_token(token, cid);
-    return 0;
+    return owner->generate_reset_token(token, cid) ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 int candidate_get_new_connection_id2_cb(ngtcp2_conn*, ngtcp2_cid* cid,
@@ -504,6 +497,13 @@ int candidate_get_new_connection_id2_cb(ngtcp2_conn*, ngtcp2_cid* cid,
 
 int candidate_early_data_rejected_cb(ngtcp2_conn*, void* user_data) {
     candidate_from(user_data)->owner->on_early_data_rejected();
+    return 0;
+}
+
+int candidate_recv_new_token_cb(ngtcp2_conn*, const uint8_t* token, size_t tokenlen,
+                                void* user_data) {
+    auto* candidate = candidate_from(user_data);
+    candidate->owner->cache_new_token(token, tokenlen, candidate->endpoint.family);
     return 0;
 }
 
@@ -530,13 +530,13 @@ constexpr ngtcp2_callbacks kCandidateCallbacks = {
     .rand = rand_cb,
     .get_new_connection_id = candidate_get_new_connection_id_cb,
     .remove_connection_id = [](ngtcp2_conn*, const ngtcp2_cid*, void*) -> int { return 0; },
-    .update_key = update_key_cb,
+    .update_key = ngtcp2_crypto_update_key_cb,
     .path_validation = candidate_path_validation_cb,
-    .select_preferred_addr = select_preferred_addr_cb,
+    .select_preferred_addr = nullptr,
     .stream_reset = candidate_stream_reset_cb,
     .extend_max_stream_data = candidate_extend_max_stream_data_cb,
     .handshake_confirmed = candidate_handshake_confirmed_cb,
-    .recv_new_token = recv_new_token_cb,
+    .recv_new_token = candidate_recv_new_token_cb,
     .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
     .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
     .recv_datagram = recv_datagram_cb,
@@ -627,13 +627,23 @@ void QuicClient::write_qlog_for_file(int fd, uint32_t flags, const void* data, s
     }
 }
 
-void QuicClient::generate_reset_token(uint8_t* token, const ngtcp2_cid* cid) {
+bool QuicClient::generate_reset_token(uint8_t* token, const ngtcp2_cid* cid) {
+    if (!token || !cid) return false;
     if (stateless_reset_secret_.empty()) {
         stateless_reset_secret_.resize(32);
-        RAND_bytes(stateless_reset_secret_.data(), 32);
+        if (RAND_bytes(stateless_reset_secret_.data(),
+                       static_cast<int>(stateless_reset_secret_.size())) != 1) {
+            stateless_reset_secret_.clear();
+            return false;
+        }
     }
     ngtcp2_crypto_generate_stateless_reset_token(token, stateless_reset_secret_.data(),
                                                  stateless_reset_secret_.size(), cid);
+    return true;
+}
+
+void QuicClient::cache_new_token(const uint8_t* token, size_t tokenlen, int family) {
+    tls_ctx_.cache_new_token(origin_.host, current_network_handle_, family, token, tokenlen);
 }
 
 void QuicClient::wakeup() {
@@ -823,14 +833,19 @@ void QuicClient::cache_0rtt_transport_params() {
 bool QuicClient::setup_connection() {
     ngtcp2_cid scid{}, dcid{};
     scid.datalen = 8;
-    RAND_bytes(scid.data, 8);
     dcid.datalen = 8;
-    RAND_bytes(dcid.data, 8);
+    if (RAND_bytes(scid.data, static_cast<int>(scid.datalen)) != 1 ||
+        RAND_bytes(dcid.data, static_cast<int>(dcid.datalen)) != 1) {
+        terminal_error_ = KATHTTP3_ERR_QUIC;
+        return false;
+    }
 
     ngtcp2_settings settings;
     ngtcp2_settings_default(&settings);
     settings.initial_ts = now_ns();
     settings.handshake_timeout = timeouts_.handshake_ms * NGTCP2_MILLISECONDS;
+    random_failed_.store(false, std::memory_order_release);
+    settings.rand_ctx.native_handle = &random_failed_;
     // PMTUD is deliberately enabled. ngtcp2 uses its safe built-in probe
     // sequence unless a future platform-specific policy supplies probes.
     settings.no_pmtud = 0;
@@ -871,11 +886,15 @@ bool QuicClient::setup_connection() {
         }
     }
 
+    const std::vector<uint8_t> new_token =
+        tls_ctx_.acquire_new_token(origin_.host, current_network_handle_, peer_endpoint_.family);
+    settings.token = new_token.empty() ? nullptr : new_token.data();
+    settings.tokenlen = new_token.size();
     int rv = ngtcp2_conn_client_new_versioned(
         &conn_, &dcid, &scid, &path, quic_version_ ? quic_version_ : NGTCP2_PROTO_VER_V1,
         NGTCP2_CALLBACKS_VERSION, &kCallbacks, NGTCP2_SETTINGS_VERSION, &settings,
         NGTCP2_TRANSPORT_PARAMS_VERSION, &params, nullptr, this);
-    if (rv != 0) {
+    if (rv != 0 || random_failed_.load(std::memory_order_acquire)) {
         KATHTTP3_LOG_ERR("ngtcp2_conn_client_new: %s\n", ngtcp2_strerror(rv));
         return false;
     }
@@ -925,6 +944,7 @@ bool QuicClient::start_handshake_candidate(const ResolvedEndpoint& endpoint) {
     candidate->started_at = now_ns();
     settings.initial_ts = candidate->started_at;
     settings.handshake_timeout = timeouts_.handshake_ms * NGTCP2_MILLISECONDS;
+    settings.rand_ctx.native_handle = &random_failed_;
     settings.no_pmtud = 0;
     if (candidate->qlog_fd != -1 || qlog_sink_cb_ != nullptr)
         settings.qlog_write = candidate_qlog_write_cb;
@@ -953,12 +973,16 @@ bool QuicClient::start_handshake_candidate(const ResolvedEndpoint& endpoint) {
         candidate->path.remote.addrlen = address_len;
     }
 
+    const std::vector<uint8_t> new_token =
+        tls_ctx_.acquire_new_token(origin_.host, current_network_handle_, endpoint.family);
+    settings.token = new_token.empty() ? nullptr : new_token.data();
+    settings.tokenlen = new_token.size();
     int rv = ngtcp2_conn_client_new_versioned(
         &candidate->conn, &dcid, &scid, &candidate->path,
         quic_version_ ? quic_version_ : NGTCP2_PROTO_VER_V1, NGTCP2_CALLBACKS_VERSION,
         &kCandidateCallbacks, NGTCP2_SETTINGS_VERSION, &settings, NGTCP2_TRANSPORT_PARAMS_VERSION,
         &params, nullptr, candidate.get());
-    if (rv != 0) {
+    if (rv != 0 || random_failed_.load(std::memory_order_acquire)) {
         KATHTTP3_LOG_ERR("ngtcp2_conn_client_new (Happy Eyeballs): %s\n", ngtcp2_strerror(rv));
         return false;
     }
@@ -1123,6 +1147,7 @@ bool QuicClient::run_handshake_race() {
     constexpr uint64_t kFamilyFallbackDelayNs = 250 * NGTCP2_MILLISECONDS;
     const HappyEyeballsPlan plan = make_happy_eyeballs_plan(endpoints_);
     if (!plan.enabled()) return false;
+    random_failed_.store(false, std::memory_order_release);
     if (!start_handshake_candidate(endpoints_[plan.primary])) return false;
     const uint64_t race_started = now_ns();
     bool fallback_started = false;
