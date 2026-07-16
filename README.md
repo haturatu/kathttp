@@ -347,7 +347,16 @@ appended only. Symbols are hidden by default except `kathttp3_*` exports.
   protocol-specific QUIC and HTTP/3 event schemas are defined in separate
   drafts.
 - DNS lookups run in a bounded two-thread resolver pool rather than on a QUIC
-  worker. Cancellation and DNS deadlines discard late results. When both
+  worker. Concurrent lookups for the same case-insensitive hostname, port,
+  resolver, and Android network generation share one in-flight query; each
+  caller waits asynchronously and may cancel without cancelling its peers.
+  Platform DNS caching remains owned by Android/libc because `InetAddress` and
+  `getaddrinfo` do not expose authoritative TTLs. The bundled DoH resolver
+  caches successful A/AAAA results for the minimum answer TTL and caches
+  NXDOMAIN/NODATA only when an SOA supplies the RFC 2308 negative TTL; malformed,
+  timeout, and SOA-less failures are not cached. Network changes partition
+  in-flight work and invalidate native connection state. Cancellation and DNS
+  deadlines discard late results. When both
   address families are available, the first resolver-ordered candidate starts
   a QUIC/TLS handshake immediately and the first opposite-family candidate
   starts after 250ms (or immediately after the first candidate fails). The

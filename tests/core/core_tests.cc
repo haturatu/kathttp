@@ -93,6 +93,163 @@ int main() {
         assert(dns_ready.wait_for(lock, std::chrono::seconds(1), [&] { return dns_done; }));
     }
     assert(endpoints.size() == 2 && endpoints.front().family == AF_INET6);
+
+    // Concurrent callers for one resolver/host/port share one upstream query.
+    // Waiters remain asynchronous and receive independent owned result values.
+    std::mutex flight_mutex;
+    std::condition_variable flight_ready;
+    std::condition_variable flight_release;
+    std::condition_variable flight_completed;
+    bool upstream_entered = false;
+    bool release_upstream = false;
+    size_t upstream_calls = 0;
+    size_t completed_waiters = 0;
+    auto single_flight_resolver = std::make_shared<CallbackResolver>(
+        [&](const std::string&, uint16_t port, const std::atomic<bool>*) {
+            std::unique_lock<std::mutex> lock(flight_mutex);
+            ++upstream_calls;
+            upstream_entered = true;
+            flight_ready.notify_one();
+            flight_release.wait(lock, [&] { return release_upstream; });
+            return std::vector<ResolvedEndpoint>{{"192.0.2.10", port, AF_INET}};
+        });
+    std::vector<std::shared_ptr<std::atomic<bool>>> flight_cancellations;
+    auto submit_waiter = [&] {
+        auto waiter_cancelled = std::make_shared<std::atomic<bool>>(false);
+        flight_cancellations.push_back(waiter_cancelled);
+        return resolve_async(single_flight_resolver, "RR2.GoogleVideo.COM.", 443, waiter_cancelled,
+                             [&](std::vector<ResolvedEndpoint> result) {
+                                 std::lock_guard<std::mutex> lock(flight_mutex);
+                                 if (result.size() == 1 && result.front().ip == "192.0.2.10") {
+                                     ++completed_waiters;
+                                 }
+                                 flight_completed.notify_one();
+                             });
+    };
+    const bool first_flight_scheduled = submit_waiter();
+    assert(first_flight_scheduled);
+    {
+        std::unique_lock<std::mutex> lock(flight_mutex);
+        const bool entered =
+            flight_ready.wait_for(lock, std::chrono::seconds(1), [&] { return upstream_entered; });
+        assert(entered);
+    }
+    constexpr size_t kSharedDnsWaiters = 50;
+    for (size_t i = 1; i < kSharedDnsWaiters; ++i) {
+        const bool waiter_scheduled = submit_waiter();
+        assert(waiter_scheduled);
+    }
+    {
+        std::lock_guard<std::mutex> lock(flight_mutex);
+        release_upstream = true;
+    }
+    flight_release.notify_one();
+    {
+        std::unique_lock<std::mutex> lock(flight_mutex);
+        const bool all_completed = flight_completed.wait_for(
+            lock, std::chrono::seconds(1), [&] { return completed_waiters == kSharedDnsWaiters; });
+        assert(all_completed);
+        assert(upstream_calls == 1);
+    }
+
+    // Cancelling one waiter must not cancel the shared lookup for its peers.
+    upstream_entered = false;
+    release_upstream = false;
+    completed_waiters = 0;
+    auto cancelled_waiter = std::make_shared<std::atomic<bool>>(false);
+    auto live_waiter = std::make_shared<std::atomic<bool>>(false);
+    const bool cancelled_flight_scheduled =
+        resolve_async(single_flight_resolver, "youtubei.googleapis.com", 443, cancelled_waiter,
+                      [&](std::vector<ResolvedEndpoint>) {
+                          std::lock_guard<std::mutex> lock(flight_mutex);
+                          completed_waiters += 100;
+                          flight_completed.notify_one();
+                      });
+    assert(cancelled_flight_scheduled);
+    {
+        std::unique_lock<std::mutex> lock(flight_mutex);
+        const bool entered =
+            flight_ready.wait_for(lock, std::chrono::seconds(1), [&] { return upstream_entered; });
+        assert(entered);
+    }
+    const bool live_waiter_scheduled =
+        resolve_async(single_flight_resolver, "YOUTUBEI.GOOGLEAPIS.COM.", 443, live_waiter,
+                      [&](std::vector<ResolvedEndpoint>) {
+                          std::lock_guard<std::mutex> lock(flight_mutex);
+                          ++completed_waiters;
+                          flight_completed.notify_one();
+                      });
+    assert(live_waiter_scheduled);
+    cancelled_waiter->store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(flight_mutex);
+        release_upstream = true;
+    }
+    flight_release.notify_one();
+    {
+        std::unique_lock<std::mutex> lock(flight_mutex);
+        const bool live_completed = flight_completed.wait_for(
+            lock, std::chrono::seconds(1), [&] { return completed_waiters == 1; });
+        assert(live_completed);
+    }
+
+    // A replacement Android Network gets a distinct flight even for the same
+    // hostname, so it cannot inherit addresses from the previous generation.
+    std::mutex generation_mutex;
+    std::condition_variable generation_entered;
+    std::condition_variable generation_release;
+    std::condition_variable generation_completed;
+    size_t generation_upstream_calls = 0;
+    size_t generation_callbacks = 0;
+    bool release_generations = false;
+    auto generation_upstream = std::make_shared<CallbackResolver>(
+        [&](const std::string&, uint16_t port, const std::atomic<bool>*) {
+            std::unique_lock<std::mutex> lock(generation_mutex);
+            ++generation_upstream_calls;
+            generation_entered.notify_all();
+            generation_release.wait(lock, [&] { return release_generations; });
+            return std::vector<ResolvedEndpoint>{{"192.0.2.20", port, AF_INET}};
+        });
+    auto generation_cache = std::make_shared<DnsCache>();
+    auto network_generation = std::make_shared<std::atomic<uint64_t>>(1);
+    auto generation_resolver =
+        std::make_shared<CachedResolver>(generation_upstream, generation_cache, network_generation);
+    auto first_generation_cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto second_generation_cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto generation_callback = [&](std::vector<ResolvedEndpoint>) {
+        std::lock_guard<std::mutex> lock(generation_mutex);
+        ++generation_callbacks;
+        generation_completed.notify_one();
+    };
+    const bool first_generation_scheduled =
+        resolve_async(generation_resolver, "yt3.googleusercontent.com", 443,
+                      first_generation_cancelled, generation_callback);
+    assert(first_generation_scheduled);
+    {
+        std::unique_lock<std::mutex> lock(generation_mutex);
+        const bool first_entered = generation_entered.wait_for(
+            lock, std::chrono::seconds(1), [&] { return generation_upstream_calls == 1; });
+        assert(first_entered);
+    }
+    network_generation->store(2, std::memory_order_release);
+    const bool second_generation_scheduled =
+        resolve_async(generation_resolver, "YT3.GOOGLEUSERCONTENT.COM.", 443,
+                      second_generation_cancelled, generation_callback);
+    assert(second_generation_scheduled);
+    {
+        std::unique_lock<std::mutex> lock(generation_mutex);
+        const bool both_entered = generation_entered.wait_for(
+            lock, std::chrono::seconds(1), [&] { return generation_upstream_calls == 2; });
+        assert(both_entered);
+        release_generations = true;
+    }
+    generation_release.notify_all();
+    {
+        std::unique_lock<std::mutex> lock(generation_mutex);
+        const bool both_completed = generation_completed.wait_for(
+            lock, std::chrono::seconds(1), [&] { return generation_callbacks == 2; });
+        assert(both_completed);
+    }
     const HappyEyeballsPlan v6_primary = make_happy_eyeballs_plan(endpoints);
     assert(v6_primary.enabled() && v6_primary.primary == 0 && v6_primary.fallback == 1);
     std::vector<ResolvedEndpoint> v4_primary{
@@ -159,7 +316,7 @@ int main() {
     assert(receive_credit_blocked_by_consumer(0, kReceiveBufferPerConnectionLimit));
 
     DnsCache cache({.max_entries = 1, .positive_ttl_ms = 1000, .negative_ttl_ms = 1000});
-    cache.put_success("one.test", 443, 1, endpoints);
+    cache.put_success("ONE.TEST.", 443, 1, endpoints);
     std::vector<ResolvedEndpoint> cached;
     const bool positive_cache_hit = cache.lookup("one.test", 443, 1, cached);
     assert(positive_cache_hit && cached.size() == 2);
@@ -170,5 +327,16 @@ int main() {
     cache.invalidate_network(2);
     const bool invalidated_cache_hit = cache.lookup("one.test", 443, 1, cached);
     assert(!invalidated_cache_hit);
+
+    DnsCache platform_owned_ttl_cache;
+    platform_owned_ttl_cache.put_success("platform.test", 443, 1, endpoints);
+    cached.clear();
+    const bool platform_positive_cache_hit =
+        platform_owned_ttl_cache.lookup("platform.test", 443, 1, cached);
+    assert(!platform_positive_cache_hit);
+    platform_owned_ttl_cache.put_failure("missing-platform.test", 443, 1);
+    const bool platform_negative_cache_hit =
+        platform_owned_ttl_cache.lookup("missing-platform.test", 443, 1, cached);
+    assert(!platform_negative_cache_hit);
     std::cout << "core tests passed\n";
 }

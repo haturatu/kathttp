@@ -7,10 +7,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
+#include <iterator>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include "log.h"
 
@@ -87,6 +90,41 @@ DnsWorkerPool& dns_worker_pool() {
     static DnsWorkerPool pool;
     return pool;
 }
+
+std::string canonical_host(std::string host) {
+    std::transform(host.begin(), host.end(), host.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (host.size() > 1 && host.back() == '.') host.pop_back();
+    return host;
+}
+
+struct DnsWaiter {
+    std::shared_ptr<std::atomic<bool>> cancelled;
+    DnsResolveCallback callback;
+};
+
+struct DnsFlight {
+    std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
+    std::vector<DnsWaiter> waiters;
+};
+
+constexpr size_t kMaxDnsFlightWaiters = 1024;
+
+std::mutex& dns_flights_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::unordered_map<std::string, std::shared_ptr<DnsFlight>>& dns_flights() {
+    static std::unordered_map<std::string, std::shared_ptr<DnsFlight>> flights;
+    return flights;
+}
+
+std::string dns_flight_key(const Resolver* resolver, const std::string& host, uint16_t port,
+                           uint64_t generation) {
+    return std::to_string(reinterpret_cast<uintptr_t>(resolver)) + "|" + canonical_host(host) +
+           ":" + std::to_string(port) + "@" + std::to_string(generation);
+}
 }  // namespace
 
 HappyEyeballsPlan make_happy_eyeballs_plan(const std::vector<ResolvedEndpoint>& endpoints) {
@@ -98,12 +136,15 @@ HappyEyeballsPlan make_happy_eyeballs_plan(const std::vector<ResolvedEndpoint>& 
         plan.primary = static_cast<size_t>(-1);
         return plan;
     }
-    for (size_t i = 1; i < endpoints.size(); ++i) {
-        if (endpoints[i].family != primary_family &&
-            (endpoints[i].family == AF_INET || endpoints[i].family == AF_INET6)) {
-            plan.fallback = i;
-            return plan;
-        }
+    const auto fallback =
+        std::find_if(std::next(endpoints.begin()), endpoints.end(),
+                     [primary_family](const ResolvedEndpoint& endpoint) {
+                         return endpoint.family != primary_family &&
+                                (endpoint.family == AF_INET || endpoint.family == AF_INET6);
+                     });
+    if (fallback != endpoints.end()) {
+        plan.fallback = static_cast<size_t>(std::distance(endpoints.begin(), fallback));
+        return plan;
     }
     plan.primary = static_cast<size_t>(-1);
     return plan;
@@ -124,9 +165,12 @@ DnsCache::DnsCache(Config config)
       positive_ttl_ms_(config.positive_ttl_ms),
       negative_ttl_ms_(config.negative_ttl_ms) {}
 
+// Kept as a private member to centralize the cache key contract.
+// cppcheck-suppress functionStatic
 std::string DnsCache::key(const std::string& host, uint16_t port,
                           uint64_t network_generation) const {
-    return host + ":" + std::to_string(port) + "@" + std::to_string(network_generation);
+    return canonical_host(host) + ":" + std::to_string(port) + "@" +
+           std::to_string(network_generation);
 }
 
 bool DnsCache::lookup(const std::string& host, uint16_t port, uint64_t network_generation,
@@ -151,10 +195,12 @@ bool DnsCache::lookup(const std::string& host, uint16_t port, uint64_t network_g
 void DnsCache::put_success(const std::string& host, uint16_t port, uint64_t network_generation,
                            const std::vector<ResolvedEndpoint>& endpoints) {
     if (endpoints.empty()) return put_failure(host, port, network_generation);
+    if (positive_ttl_ms_ == 0) return;
     put({key(host, port, network_generation), monotonic_ms() + positive_ttl_ms_, false, endpoints});
 }
 
 void DnsCache::put_failure(const std::string& host, uint16_t port, uint64_t network_generation) {
+    if (negative_ttl_ms_ == 0) return;
     put({key(host, port, network_generation), monotonic_ms() + negative_ttl_ms_, true, {}});
 }
 
@@ -189,13 +235,55 @@ std::vector<ResolvedEndpoint> CachedResolver::resolve(const std::string& host, u
 bool resolve_async(std::shared_ptr<Resolver> resolver, std::string host, uint16_t port,
                    std::shared_ptr<std::atomic<bool>> cancelled, DnsResolveCallback callback) {
     if (!resolver || !cancelled || !callback) return false;
-    return dns_worker_pool().submit([resolver = std::move(resolver), host = std::move(host), port,
-                                     cancelled = std::move(cancelled),
-                                     callback = std::move(callback)]() mutable {
-        if (cancelled->load(std::memory_order_acquire)) return;
-        auto endpoints = resolver->resolve(host, port, cancelled.get());
-        if (!cancelled->load(std::memory_order_acquire)) callback(std::move(endpoints));
-    });
+    if (cancelled->load(std::memory_order_acquire)) return true;
+
+    const std::string key =
+        dns_flight_key(resolver.get(), host, port, resolver->flight_generation());
+    std::lock_guard<std::mutex> lock(dns_flights_mutex());
+    auto existing = dns_flights().find(key);
+    if (existing != dns_flights().end()) {
+        if (existing->second->waiters.size() >= kMaxDnsFlightWaiters) return false;
+        existing->second->waiters.push_back({std::move(cancelled), std::move(callback)});
+        return true;
+    }
+
+    auto flight = std::make_shared<DnsFlight>();
+    flight->waiters.push_back({std::move(cancelled), std::move(callback)});
+    dns_flights().emplace(key, flight);
+    const bool submitted = dns_worker_pool().submit(
+        [resolver = std::move(resolver), host = std::move(host), port, key, flight]() mutable {
+            std::vector<ResolvedEndpoint> endpoints;
+            try {
+                endpoints = resolver->resolve(host, port, flight->cancelled.get());
+            } catch (...) {
+                KATHTTP3_LOG_ERR("resolver threw for %s:%u\n", host.c_str(), port);
+            }
+
+            std::vector<DnsWaiter> waiters;
+            {
+                std::lock_guard<std::mutex> flights_lock(dns_flights_mutex());
+                auto it = dns_flights().find(key);
+                if (it != dns_flights().end() && it->second == flight) {
+                    waiters = std::move(it->second->waiters);
+                    dns_flights().erase(it);
+                }
+            }
+            if (waiters.size() > 1) {
+                KATHTTP3_LOG_DEBUG("DNS single-flight completed %s:%u waiters=%zu endpoints=%zu\n",
+                                   host.c_str(), port, waiters.size(), endpoints.size());
+            }
+            for (auto& waiter : waiters) {
+                if (waiter.cancelled->load(std::memory_order_acquire)) continue;
+                try {
+                    waiter.callback(endpoints);
+                } catch (...) {
+                    KATHTTP3_LOG_WARN("DNS completion callback threw for %s:%u\n", host.c_str(),
+                                      port);
+                }
+            }
+        });
+    if (!submitted) dns_flights().erase(key);
+    return submitted;
 }
 
 std::vector<ResolvedEndpoint> GetAddrInfoResolver::resolve(const std::string& host, uint16_t port,
