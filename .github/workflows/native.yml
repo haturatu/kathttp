@@ -63,7 +63,7 @@ jobs:
         run: >-
           sudo apt-get update -qq && sudo apt-get install -y
           cmake ninja-build pkg-config git openssl libssl-dev
-          libnghttp3-dev libngtcp2-dev libngtcp2-crypto-ossl-dev
+          libnghttp3-dev libngtcp2-dev
       - name: Build ngtcp2 example HTTP/3 server
         run: |
           git clone --depth 1 --recurse-submodules https://github.com/ngtcp2/ngtcp2.git ../ngtcp2
@@ -93,7 +93,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update -qq && sudo apt-get install -y clang clang-tidy cppcheck cmake ninja-build pkg-config libngtcp2-dev libnghttp3-dev libngtcp2-crypto-ossl-dev
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang clang-tidy cppcheck cmake ninja-build pkg-config libngtcp2-dev libnghttp3-dev
       - run: >-
           cmake -S . -B build-tidy -G Ninja
           -DCMAKE_CXX_COMPILER=clang++
@@ -127,7 +127,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      - run: sudo apt-get update -qq && sudo apt-get install -y clang cmake ninja-build pkg-config libngtcp2-dev libnghttp3-dev libngtcp2-crypto-ossl-dev
+      - run: sudo apt-get update -qq && sudo apt-get install -y clang cmake ninja-build pkg-config libngtcp2-dev libnghttp3-dev
       - run: >-
           cmake -S . -B build-fuzz -G Ninja
           -DCMAKE_CXX_COMPILER=clang++
