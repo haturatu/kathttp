@@ -90,8 +90,15 @@ jobs:
           git -C ../boringssl checkout --detach FETCH_HEAD
           cmake -S ../boringssl -B ../boringssl-build -G Ninja
           cmake --build ../boringssl-build --parallel
+          # The BoringSSL archives are deliberately static.  ngtcp2's CMake
+          # symbol probes link them with the C linker, which is not reliable
+          # for this pinned C++ archive.  Assert the two required declarations
+          # in the fixed source and seed the corresponding CMake cache values.
+          grep -q '^#define OPENSSL_IS_BORINGSSL' ../boringssl/include/openssl/base.h
+          grep -q 'SSL_set_quic_early_data_context' ../boringssl/include/openssl/ssl.h
           git clone --depth 1 --branch v1.24.0 --recurse-submodules https://github.com/ngtcp2/ngtcp2.git ../ngtcp2
           cmake -S ../ngtcp2 -B ../ngtcp2-build -G Ninja -DCMAKE_INSTALL_PREFIX="$PWD/../quic-prefix" -DENABLE_EXAMPLES=ON -DENABLE_OPENSSL=OFF -DENABLE_BORINGSSL=ON \
+            -DHAVE_BORINGSSL=1 -DHAVE_SSL_SET_QUIC_EARLY_DATA_CONTEXT=1 \
             -DBORINGSSL_INCLUDE_DIR="$PWD/../boringssl/include" \
             -DBORINGSSL_LIBRARIES="$PWD/../boringssl-build/ssl/libssl.a;$PWD/../boringssl-build/crypto/libcrypto.a" \
             -DLIBNGHTTP3_INCLUDE_DIR="$PWD/../h3-prefix/include" \
