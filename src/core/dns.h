@@ -44,6 +44,12 @@ class Resolver {
     virtual ~Resolver() = default;
     virtual std::vector<ResolvedEndpoint> resolve(const std::string& host, uint16_t port,
                                                   const std::atomic<bool>* stop = nullptr) = 0;
+    /* Partitions asynchronous single-flight work. Network-aware resolvers
+     * return their current generation so a request on a replacement Android
+     * Network never joins an older in-flight lookup. */
+    virtual uint64_t flight_generation() const {
+        return 0;
+    }
 };
 
 class GetAddrInfoResolver : public Resolver {
@@ -52,15 +58,17 @@ class GetAddrInfoResolver : public Resolver {
                                           const std::atomic<bool>* stop = nullptr) override;
 };
 
-/* Small, network-scoped cache for resolver results. getaddrinfo does not
- * expose authoritative TTLs, so callers use conservative internal lifetimes.
- * Certificate and protocol failures must never be inserted here. */
+/* Small, network-scoped cache for resolver results. A zero lifetime disables
+ * that cache class. getaddrinfo/InetAddress do not expose authoritative TTLs,
+ * so the default leaves caching to the platform resolver instead of extending
+ * DNS data past its authoritative lifetime. Certificate, timeout and protocol
+ * failures must never be inserted here. */
 class DnsCache {
    public:
     struct Config {
         size_t max_entries = 128;
-        uint64_t positive_ttl_ms = 30000;
-        uint64_t negative_ttl_ms = 2000;
+        uint64_t positive_ttl_ms = 0;
+        uint64_t negative_ttl_ms = 0;
     };
 
     DnsCache();
@@ -97,6 +105,9 @@ class CachedResolver : public Resolver {
           generation_(std::move(network_generation)) {}
     std::vector<ResolvedEndpoint> resolve(const std::string& host, uint16_t port,
                                           const std::atomic<bool>* stop = nullptr) override;
+    uint64_t flight_generation() const override {
+        return generation_->load(std::memory_order_acquire);
+    }
 
    private:
     std::shared_ptr<Resolver> upstream_;
