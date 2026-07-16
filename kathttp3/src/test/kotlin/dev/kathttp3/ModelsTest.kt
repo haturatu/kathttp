@@ -84,6 +84,10 @@ class ModelsTest {
     @Test fun requestRequiresHttps() { assertFailsWith<IllegalArgumentException> { KatHttp3Request("GET", "http://example.com") } }
     @Test fun headerRejectsInjection() { assertFailsWith<IllegalArgumentException> { KatHttp3Header("x", "ok\r\nbad") } }
     @Test fun immutableValueBasics() { assertEquals("GET", KatHttp3Request("GET", "https://example.com").method) }
+    @Test fun requestPriorityValidatesRfc9218Urgency() {
+        assertFailsWith<IllegalArgumentException> { KatHttp3RequestPriority(urgency = -1) }
+        assertFailsWith<IllegalArgumentException> { KatHttp3RequestPriority(urgency = 8) }
+    }
     @Test fun requestSchedulerUsesEffectiveOrigin() {
         assertEquals("https://example.com:443", OriginRequestScheduler.originOf("https://EXAMPLE.com/path"))
         assertEquals("https://example.com:8443", OriginRequestScheduler.originOf("https://example.com:8443/path"))
@@ -103,6 +107,30 @@ class ModelsTest {
         val waiting = async { scheduler.acquire("https://example.com") }
         assertFailsWith<KatHttp3Exception.RequestQueueTimeout> { waiting.await() }
         permit.close()
+        scheduler.close()
+    } }
+    @Test fun requestSchedulerAdmitsHigherUrgencyFirst() = runBlocking { supervisorScope {
+        val scheduler = OriginRequestScheduler(1, 4, 1_000)
+        val active = scheduler.acquire("https://example.com")
+        val order = mutableListOf<String>()
+        val low = async {
+            scheduler.acquire(
+                "https://example.com",
+                KatHttp3RequestPriority(urgency = 7),
+            ).use { order += "low" }
+        }
+        delay(10)
+        val high = async {
+            scheduler.acquire(
+                "https://example.com",
+                KatHttp3RequestPriority(urgency = 0),
+            ).use { order += "high" }
+        }
+        delay(10)
+        active.close()
+        high.await()
+        low.await()
+        assertEquals(listOf("high", "low"), order)
         scheduler.close()
     } }
 }

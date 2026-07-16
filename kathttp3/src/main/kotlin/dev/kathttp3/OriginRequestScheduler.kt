@@ -8,7 +8,6 @@ import java.net.URI
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.resume
 
 /**
  * Client-side admission control, deliberately independent of QUIC's peer
@@ -21,16 +20,23 @@ internal class OriginRequestScheduler(
     private val maxQueued: Int,
     private val queueTimeoutMillis: Long,
 ) : AutoCloseable {
+    private data class Waiter(
+        val continuation: CancellableContinuation<Permit>,
+    )
+
     private data class OriginState(
         var active: Int = 0,
-        val waiters: ArrayDeque<CancellableContinuation<Permit>> = ArrayDeque(),
+        val waiters: Array<ArrayDeque<Waiter>> = Array(8) { ArrayDeque() },
     )
 
     private val lock = Any()
     private val origins = mutableMapOf<String, OriginState>()
     private var closed = false
 
-    suspend fun acquire(url: String): Permit {
+    suspend fun acquire(
+        url: String,
+        priority: KatHttp3RequestPriority = KatHttp3RequestPriority(),
+    ): Permit {
         val origin = originOf(url)
         try {
             return withTimeout(queueTimeoutMillis) {
@@ -44,16 +50,20 @@ internal class OriginRequestScheduler(
                             if (state.active < maxActive) {
                                 state.active += 1
                                 acquired = true
-                            } else if (state.waiters.size >= maxQueued) {
+                            } else if (state.waiters.sumOf { it.size } >= maxQueued) {
                                 continuation.resumeWith(
                                     Result.failure(KatHttp3Exception.RequestQueueFull(origin)),
                                 )
                             } else {
-                                state.waiters.addLast(continuation)
+                                state.waiters[priority.urgency].addLast(Waiter(continuation))
                             }
                         }
                     }
-                    if (acquired) continuation.resume(Permit(this@OriginRequestScheduler, origin))
+                    if (acquired) {
+                        continuation.resume(Permit(this@OriginRequestScheduler, origin)) {
+                                _, permit, _ -> permit.close()
+                        }
+                    }
                     continuation.invokeOnCancellation { removeWaiter(origin, continuation) }
                 }
             }
@@ -65,7 +75,7 @@ internal class OriginRequestScheduler(
     private fun removeWaiter(origin: String, continuation: CancellableContinuation<Permit>) {
         synchronized(lock) {
             val state = origins[origin] ?: return
-            state.waiters.remove(continuation)
+            state.waiters.forEach { queue -> queue.removeAll { it.continuation == continuation } }
             removeIdleState(origin, state)
         }
     }
@@ -74,23 +84,26 @@ internal class OriginRequestScheduler(
         var next: CancellableContinuation<Permit>? = null
         synchronized(lock) {
             val state = origins[origin] ?: return
-            while (state.waiters.isNotEmpty()) {
-                val candidate = state.waiters.removeFirst()
-                if (candidate.isActive) {
-                    next = candidate
-                    break
+            for (queue in state.waiters) {
+                while (queue.isNotEmpty()) {
+                    val candidate = queue.removeFirst().continuation
+                    if (candidate.isActive) {
+                        next = candidate
+                        break
+                    }
                 }
+                if (next != null) break
             }
             if (next == null) {
                 state.active -= 1
                 removeIdleState(origin, state)
             }
         }
-        next?.resume(Permit(this, origin))
+        next?.resume(Permit(this, origin)) { _, permit, _ -> permit.close() }
     }
 
     private fun removeIdleState(origin: String, state: OriginState) {
-        if (state.active == 0 && state.waiters.isEmpty()) origins.remove(origin)
+        if (state.active == 0 && state.waiters.all { it.isEmpty() }) origins.remove(origin)
     }
 
     override fun close() {
@@ -99,7 +112,9 @@ internal class OriginRequestScheduler(
             if (closed) return
             closed = true
             origins.values.forEach { state ->
-                while (state.waiters.isNotEmpty()) waiters += state.waiters.removeFirst()
+                state.waiters.forEach { queue ->
+                    while (queue.isNotEmpty()) waiters += queue.removeFirst().continuation
+                }
             }
             origins.clear()
         }

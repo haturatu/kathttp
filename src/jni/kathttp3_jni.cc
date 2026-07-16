@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -27,49 +28,107 @@ std::unordered_map<kathttp3_client*, std::unique_ptr<kathttp3::AndroidQlogLogcat
     g_qlog_logcat_sinks;
 #endif
 
-/* Per-client state for a Kotlin DnsResolver injected through the options.
- * Class/method IDs are resolved on the calling (Java) thread at create time,
- * where the app class loader is available, then used from the native worker
- * thread (which would fail FindClass otherwise). */
+struct JniCache {
+    jclass string_class = nullptr;
+    jclass list_class = nullptr;
+    jclass address_class = nullptr;
+    jclass resolver_class = nullptr;
+    jclass callback_class = nullptr;
+    jmethodID list_size = nullptr;
+    jmethodID list_get = nullptr;
+    jmethodID address_ip = nullptr;
+    jmethodID address_port = nullptr;
+    jmethodID resolver_resolve = nullptr;
+    jmethodID callback_headers = nullptr;
+    jmethodID callback_body = nullptr;
+    jmethodID callback_complete = nullptr;
+    jmethodID callback_error = nullptr;
+};
+JniCache g_jni;
+
+void release_jni_cache(JNIEnv* env);
+
+bool cache_class(JNIEnv* env, const char* name, jclass* destination) {
+    jclass local = env->FindClass(name);
+    if (!local) return false;
+    *destination = reinterpret_cast<jclass>(env->NewGlobalRef(local));
+    env->DeleteLocalRef(local);
+    return *destination != nullptr;
+}
+
+bool initialize_jni_cache(JNIEnv* env) {
+    if (!cache_class(env, "java/lang/String", &g_jni.string_class) ||
+        !cache_class(env, "java/util/List", &g_jni.list_class) ||
+        !cache_class(env, "dev/kathttp3/ResolvedAddress", &g_jni.address_class) ||
+        !cache_class(env, "dev/kathttp3/DnsResolver", &g_jni.resolver_class) ||
+        !cache_class(env, "dev/kathttp3/internal/NativeCallback", &g_jni.callback_class)) {
+        release_jni_cache(env);
+        return false;
+    }
+    g_jni.list_size = env->GetMethodID(g_jni.list_class, "size", "()I");
+    g_jni.list_get = env->GetMethodID(g_jni.list_class, "get", "(I)Ljava/lang/Object;");
+    g_jni.address_ip = env->GetMethodID(g_jni.address_class, "getIp", "()Ljava/lang/String;");
+    g_jni.address_port = env->GetMethodID(g_jni.address_class, "getPort", "()I");
+    g_jni.resolver_resolve =
+        env->GetMethodID(g_jni.resolver_class, "resolve", "(Ljava/lang/String;I)Ljava/util/List;");
+    g_jni.callback_headers = env->GetMethodID(g_jni.callback_class, "onHeaders",
+                                              "(I[Ljava/lang/String;[Ljava/lang/String;)V");
+    g_jni.callback_body = env->GetMethodID(g_jni.callback_class, "onBody", "([B)V");
+    g_jni.callback_complete = env->GetMethodID(g_jni.callback_class, "onComplete", "()V");
+    g_jni.callback_error = env->GetMethodID(g_jni.callback_class, "onError", "(I)V");
+    const bool ready = !env->ExceptionCheck() && g_jni.list_size && g_jni.list_get &&
+                       g_jni.address_ip && g_jni.address_port && g_jni.resolver_resolve &&
+                       g_jni.callback_headers && g_jni.callback_body && g_jni.callback_complete &&
+                       g_jni.callback_error;
+    if (!ready) release_jni_cache(env);
+    return ready;
+}
+
+void release_jni_cache(JNIEnv* env) {
+    jclass* classes[] = {&g_jni.string_class, &g_jni.list_class, &g_jni.address_class,
+                         &g_jni.resolver_class, &g_jni.callback_class};
+    for (jclass* cls : classes) {
+        if (*cls) env->DeleteGlobalRef(*cls);
+        *cls = nullptr;
+    }
+    g_jni = JniCache{};
+}
+
+/* Per-client state for a Kotlin DnsResolver injected through the options. */
 struct ResolverCtx {
-    jobject resolver = nullptr;      /* global ref */
-    jmethodID resolve_mid = nullptr; /* DnsResolver.resolve */
-    jclass list_class = nullptr;     /* global ref to java/util/List */
-    jmethodID list_size_mid = nullptr;
-    jmethodID list_get_mid = nullptr;
-    jclass addr_class = nullptr;  /* global ref to dev/kathttp3/ResolvedAddress */
-    jmethodID ip_mid = nullptr;   /* ResolvedAddress.getIp */
-    jmethodID port_mid = nullptr; /* ResolvedAddress.getPort */
+    jobject resolver = nullptr; /* global ref */
 };
 
-class EnvScope {
+class ThreadEnv {
    public:
-    EnvScope() {
+    JNIEnv* get() {
+        if (env_) return env_;
+        if (!g_vm) return nullptr;
         if (g_vm->GetEnv(reinterpret_cast<void**>(&env_), JNI_VERSION_1_6) != JNI_OK) {
 #ifdef __ANDROID__
-            if (g_vm->AttachCurrentThread(&env_, nullptr) == JNI_OK)
+            if (g_vm->AttachCurrentThreadAsDaemon(&env_, nullptr) == JNI_OK)
                 attached_ = true;
             else
                 env_ = nullptr;
 #else
-            if (g_vm->AttachCurrentThread(reinterpret_cast<void**>(&env_), nullptr) == JNI_OK)
+            if (g_vm->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env_), nullptr) ==
+                JNI_OK)
                 attached_ = true;
             else
                 env_ = nullptr;
 #endif
         }
-    }
-    ~EnvScope() {
-        if (attached_) g_vm->DetachCurrentThread();
-    }
-    JNIEnv* get() const {
         return env_;
+    }
+    ~ThreadEnv() {
+        if (attached_ && g_vm) g_vm->DetachCurrentThread();
     }
 
    private:
     JNIEnv* env_ = nullptr;
     bool attached_ = false;
 };
+thread_local ThreadEnv g_thread_env;
 
 struct CallbackState {
     jobject callback = nullptr;
@@ -94,27 +153,26 @@ int jni_resolve_cb(const char* host, uint16_t port, void* userdata, kathttp3_res
                    size_t* out_count) {
     auto* ctx = static_cast<ResolverCtx*>(userdata);
     if (!ctx || !ctx->resolver || !out || !out_count) return -1;
-    EnvScope scope;
-    JNIEnv* env = scope.get();
+    JNIEnv* env = g_thread_env.get();
     if (!env) return -1;
 
     jstring jhost = env->NewStringUTF(host);
-    jobject list =
-        env->CallObjectMethod(ctx->resolver, ctx->resolve_mid, jhost, static_cast<jint>(port));
+    jobject list = env->CallObjectMethod(ctx->resolver, g_jni.resolver_resolve, jhost,
+                                         static_cast<jint>(port));
     env->DeleteLocalRef(jhost);
     if (!list || env->ExceptionCheck()) {
         if (env->ExceptionCheck()) env->ExceptionClear();
         return -1;
     }
 
-    jint count = env->CallIntMethod(list, ctx->list_size_mid);
+    jint count = env->CallIntMethod(list, g_jni.list_size);
     size_t cap = *out_count;
     size_t written = 0;
     for (jint i = 0; i < count && written < cap; ++i) {
-        jobject elem = env->CallObjectMethod(list, ctx->list_get_mid, i);
+        jobject elem = env->CallObjectMethod(list, g_jni.list_get, i);
         if (!elem) continue;
-        jstring jip = reinterpret_cast<jstring>(env->CallObjectMethod(elem, ctx->ip_mid));
-        jint aport = env->CallIntMethod(elem, ctx->port_mid);
+        jstring jip = reinterpret_cast<jstring>(env->CallObjectMethod(elem, g_jni.address_ip));
+        jint aport = env->CallIntMethod(elem, g_jni.address_port);
         const char* ip = jip ? env->GetStringUTFChars(jip, nullptr) : nullptr;
         if (ip && *ip) {
             int family = (std::strchr(ip, ':') != nullptr) ? AF_INET6 : AF_INET;
@@ -136,27 +194,23 @@ int jni_resolve_cb(const char* host, uint16_t port, void* userdata, kathttp3_res
 void free_resolver_ctx(JNIEnv* env, ResolverCtx* ctx) {
     if (!ctx) return;
     if (ctx->resolver) env->DeleteGlobalRef(ctx->resolver);
-    if (ctx->list_class) env->DeleteGlobalRef(ctx->list_class);
-    if (ctx->addr_class) env->DeleteGlobalRef(ctx->addr_class);
     delete ctx;
 }
 
 void event_cb(void* opaque, const kathttp3_event* event) noexcept {
     auto* state = static_cast<CallbackState*>(opaque);
     if (!state || !event || state->terminal.load(std::memory_order_acquire)) return;
-    EnvScope scope;
-    JNIEnv* env = scope.get();
+    JNIEnv* env = g_thread_env.get();
     if (!env) return;
-    jclass cls = env->GetObjectClass(state->callback);
-    if (!cls) {
-        env->ExceptionClear();
-        return;
-    }
     if (event->type == KATHTTP3_EVENT_HEADERS) {
-        jclass str = env->FindClass("java/lang/String");
-        jobjectArray names = env->NewObjectArray(event->header_count, str, nullptr);
-        jobjectArray values = env->NewObjectArray(event->header_count, str, nullptr);
-        for (size_t i = 0; i < event->header_count && !env->ExceptionCheck(); ++i) {
+        if (event->header_count > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+            KATHTTP3_LOG_ERR("JNI header count exceeds jsize\n");
+            return;
+        }
+        const auto header_count = static_cast<jsize>(event->header_count);
+        jobjectArray names = env->NewObjectArray(header_count, g_jni.string_class, nullptr);
+        jobjectArray values = env->NewObjectArray(header_count, g_jni.string_class, nullptr);
+        for (jsize i = 0; i < header_count && !env->ExceptionCheck(); ++i) {
             jstring n = env->NewStringUTF(event->names[i]);
             jstring v = env->NewStringUTF(event->values[i]);
             env->SetObjectArrayElement(names, i, n);
@@ -164,49 +218,58 @@ void event_cb(void* opaque, const kathttp3_event* event) noexcept {
             env->DeleteLocalRef(n);
             env->DeleteLocalRef(v);
         }
-        jmethodID mid =
-            env->GetMethodID(cls, "onHeaders", "(I[Ljava/lang/String;[Ljava/lang/String;)V");
-        if (mid) env->CallVoidMethod(state->callback, mid, event->status_code, names, values);
+        if (names && values)
+            env->CallVoidMethod(state->callback, g_jni.callback_headers, event->status_code, names,
+                                values);
         env->DeleteLocalRef(names);
         env->DeleteLocalRef(values);
     } else if (event->type == KATHTTP3_EVENT_BODY) {
-        jbyteArray data = env->NewByteArray(event->data_len);
+        if (event->data_len > static_cast<size_t>(std::numeric_limits<jsize>::max())) {
+            KATHTTP3_LOG_ERR("JNI body chunk exceeds jsize\n");
+            return;
+        }
+        const auto data_len = static_cast<jsize>(event->data_len);
+        jbyteArray data = env->NewByteArray(data_len);
         if (data)
-            env->SetByteArrayRegion(data, 0, event->data_len,
-                                    reinterpret_cast<const jbyte*>(event->data));
-        jmethodID mid = env->GetMethodID(cls, "onBody", "([B)V");
-        if (mid && data) env->CallVoidMethod(state->callback, mid, data);
+            env->SetByteArrayRegion(data, 0, data_len, reinterpret_cast<const jbyte*>(event->data));
+        if (data) env->CallVoidMethod(state->callback, g_jni.callback_body, data);
         if (data) env->DeleteLocalRef(data);
     } else {
         if (!state->terminal.exchange(true, std::memory_order_acq_rel)) {
-            const char* name = event->type == KATHTTP3_EVENT_COMPLETE ? "onComplete" : "onError";
-            const char* sig = event->type == KATHTTP3_EVENT_COMPLETE ? "()V" : "(I)V";
-            jmethodID mid = env->GetMethodID(cls, name, sig);
-            if (mid) {
-                if (event->type == KATHTTP3_EVENT_COMPLETE)
-                    env->CallVoidMethod(state->callback, mid);
-                else
-                    env->CallVoidMethod(state->callback, mid, event->error_code);
-            }
+            if (event->type == KATHTTP3_EVENT_COMPLETE)
+                env->CallVoidMethod(state->callback, g_jni.callback_complete);
+            else
+                env->CallVoidMethod(state->callback, g_jni.callback_error, event->error_code);
             if (env->ExceptionCheck()) env->ExceptionClear();
-            env->DeleteLocalRef(cls);
             release_state(env, state);
             return;
         }
     }
     if (env->ExceptionCheck()) env->ExceptionClear();
-    env->DeleteLocalRef(cls);
 }
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     g_vm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK ||
+        !initialize_jni_cache(env)) {
+        if (env && env->ExceptionCheck()) env->ExceptionClear();
+        return JNI_ERR;
+    }
     // Build the platform (Android) certificate verifier and register it so
     // the core uses X509TrustManager for TRUST_PLATFORM.
     if (auto* v = kathttp3::create_android_platform_verifier(vm)) {
         kathttp3::set_platform_cert_verifier(v);
     }
     return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK)
+        release_jni_cache(env);
+    g_vm = nullptr;
 }
 
 extern "C" JNIEXPORT jlong JNICALL Java_dev_kathttp3_internal_NativeBridge_createClient(
@@ -217,17 +280,17 @@ extern "C" JNIEXPORT jlong JNICALL Java_dev_kathttp3_internal_NativeBridge_creat
     jstring qlogPath, jobject resolver) {
     kathttp3_client_options o;
     kathttp3_client_options_init(&o);
-    o.connect_timeout_ms = connect;
-    o.request_timeout_ms = request;
-    o.idle_timeout_ms = idle;
-    o.dns_timeout_ms = dns;
-    o.handshake_timeout_ms = handshake;
-    o.response_headers_timeout_ms = response_headers;
-    o.read_timeout_ms = read;
-    o.write_timeout_ms = write;
-    o.call_timeout_ms = call;
-    o.consumer_stall_timeout_ms = consumer_stall;
-    o.max_redirects = redirects;
+    o.connect_timeout_ms = static_cast<uint64_t>(connect);
+    o.request_timeout_ms = static_cast<uint64_t>(request);
+    o.idle_timeout_ms = static_cast<uint64_t>(idle);
+    o.dns_timeout_ms = static_cast<uint64_t>(dns);
+    o.handshake_timeout_ms = static_cast<uint64_t>(handshake);
+    o.response_headers_timeout_ms = static_cast<uint64_t>(response_headers);
+    o.read_timeout_ms = static_cast<uint64_t>(read);
+    o.write_timeout_ms = static_cast<uint64_t>(write);
+    o.call_timeout_ms = static_cast<uint64_t>(call);
+    o.consumer_stall_timeout_ms = static_cast<uint64_t>(consumer_stall);
+    o.max_redirects = static_cast<uint32_t>(redirects);
     o.trust_mode = static_cast<uint32_t>(trustMode);
     o.insecure_cert = insecure ? 1 : 0;
     o.enable_cookies = enable_cookies ? 1 : 0;
@@ -261,34 +324,9 @@ extern "C" JNIEXPORT jlong JNICALL Java_dev_kathttp3_internal_NativeBridge_creat
     if (resolver) {
         rctx = new (std::nothrow) ResolverCtx;
         if (rctx) {
-            jclass rc = env->GetObjectClass(resolver);
-            jclass lc = env->FindClass("java/util/List");
-            jclass ac = env->FindClass("dev/kathttp3/ResolvedAddress");
             rctx->resolver = env->NewGlobalRef(resolver);
-            rctx->resolve_mid =
-                rc ? env->GetMethodID(rc, "resolve", "(Ljava/lang/String;I)Ljava/util/List;")
-                   : nullptr;
-            rctx->list_class = lc ? reinterpret_cast<jclass>(env->NewGlobalRef(lc)) : nullptr;
-            rctx->list_size_mid = (rctx->list_class && !env->ExceptionCheck())
-                                      ? env->GetMethodID(rctx->list_class, "size", "()I")
-                                      : nullptr;
-            rctx->list_get_mid =
-                (rctx->list_class && !env->ExceptionCheck())
-                    ? env->GetMethodID(rctx->list_class, "get", "(I)Ljava/lang/Object;")
-                    : nullptr;
-            rctx->addr_class = ac ? reinterpret_cast<jclass>(env->NewGlobalRef(ac)) : nullptr;
-            rctx->ip_mid = (rctx->addr_class && !env->ExceptionCheck())
-                               ? env->GetMethodID(rctx->addr_class, "getIp", "()Ljava/lang/String;")
-                               : nullptr;
-            rctx->port_mid = (rctx->addr_class && !env->ExceptionCheck())
-                                 ? env->GetMethodID(rctx->addr_class, "getPort", "()I")
-                                 : nullptr;
             if (env->ExceptionCheck()) env->ExceptionClear();
-            if (rc) env->DeleteLocalRef(rc);
-            if (lc) env->DeleteLocalRef(lc);
-            if (ac) env->DeleteLocalRef(ac);
-            if (rctx->resolve_mid && rctx->list_class && rctx->list_size_mid &&
-                rctx->list_get_mid && rctx->addr_class && rctx->ip_mid && rctx->port_mid) {
+            if (rctx->resolver) {
                 o.resolve_cb = jni_resolve_cb;
                 o.resolve_cb_userdata = rctx;
             } else {
@@ -422,7 +460,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_dev_kathttp3_internal_NativeBridge_ex
     if (body) {
         jsize len = env->GetArrayLength(body);
         jbyte* data = env->GetByteArrayElements(body, nullptr);
-        int rc = kathttp3_request_set_body(req, reinterpret_cast<uint8_t*>(data), len);
+        int rc = kathttp3_request_set_body(req, reinterpret_cast<uint8_t*>(data),
+                                           static_cast<size_t>(len));
         env->ReleaseByteArrayElements(body, data, JNI_ABORT);
         if (rc != 0) {
             kathttp3_request_destroy(req);

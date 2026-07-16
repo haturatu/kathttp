@@ -55,33 +55,76 @@ class DnsWorkerPool {
             if (thread.joinable()) thread.join();
     }
 
-    bool submit(std::function<void()> task) {
+    bool submit(std::function<void()> task, std::shared_ptr<std::atomic<bool>> cancelled) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_ || tasks_.size() >= kMaxQueuedTasks) return false;
-        tasks_.push_back(std::move(task));
+        if (stopping_) return false;
+        prune_queue(tasks_);
+        prune_queue(pending_hosts_);
+        promote_pending();
+        Work work{std::move(task), std::move(cancelled)};
+        if (tasks_.size() < kMaxQueuedTasks) {
+            tasks_.push_back(std::move(work));
+        } else {
+            if (pending_hosts_.size() >= kMaxPendingHosts) return false;
+            pending_hosts_.push_back(std::move(work));
+        }
         cv_.notify_one();
         return true;
     }
 
+    void prune_cancelled() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        prune_queue(tasks_);
+        prune_queue(pending_hosts_);
+        promote_pending();
+        if (!tasks_.empty()) cv_.notify_all();
+    }
+
    private:
+    struct Work {
+        std::function<void()> run;
+        std::shared_ptr<std::atomic<bool>> cancelled;
+    };
+
+    static void prune_queue(std::deque<Work>& queue) {
+        queue.erase(std::remove_if(queue.begin(), queue.end(),
+                                   [](const Work& work) {
+                                       return work.cancelled &&
+                                              work.cancelled->load(std::memory_order_acquire);
+                                   }),
+                    queue.end());
+    }
+
+    void promote_pending() {
+        while (tasks_.size() < kMaxQueuedTasks && !pending_hosts_.empty()) {
+            tasks_.push_back(std::move(pending_hosts_.front()));
+            pending_hosts_.pop_front();
+        }
+    }
+
     void worker() {
         for (;;) {
-            std::function<void()> task;
+            Work work;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
                 if (stopping_ && tasks_.empty()) return;
-                task = std::move(tasks_.front());
+                work = std::move(tasks_.front());
                 tasks_.pop_front();
+                prune_queue(tasks_);
+                prune_queue(pending_hosts_);
+                promote_pending();
             }
-            task();
+            if (!work.cancelled || !work.cancelled->load(std::memory_order_acquire)) work.run();
         }
     }
 
     static constexpr size_t kMaxQueuedTasks = 32;
+    static constexpr size_t kMaxPendingHosts = 128;
     std::mutex mutex_;
     std::condition_variable cv_;
-    std::deque<std::function<void()>> tasks_;
+    std::deque<Work> tasks_;
+    std::deque<Work> pending_hosts_;
     std::vector<std::thread> workers_;
     bool stopping_ = false;
 };
@@ -106,6 +149,14 @@ struct DnsWaiter {
 struct DnsFlight {
     std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
     std::vector<DnsWaiter> waiters;
+};
+
+struct DnsTaskContext {
+    std::shared_ptr<Resolver> resolver;
+    std::string host;
+    uint16_t port = 0;
+    std::string key;
+    std::shared_ptr<DnsFlight> flight;
 };
 
 constexpr size_t kMaxDnsFlightWaiters = 1024;
@@ -250,40 +301,81 @@ bool resolve_async(std::shared_ptr<Resolver> resolver, std::string host, uint16_
     auto flight = std::make_shared<DnsFlight>();
     flight->waiters.push_back({std::move(cancelled), std::move(callback)});
     dns_flights().emplace(key, flight);
+    auto task = std::make_shared<DnsTaskContext>(
+        DnsTaskContext{std::move(resolver), std::move(host), port, key, flight});
     const bool submitted = dns_worker_pool().submit(
-        [resolver = std::move(resolver), host = std::move(host), port, key, flight]() mutable {
-            std::vector<ResolvedEndpoint> endpoints;
+        [task]() noexcept {
             try {
-                endpoints = resolver->resolve(host, port, flight->cancelled.get());
-            } catch (...) {
-                KATHTTP3_LOG_ERR("resolver threw for %s:%u\n", host.c_str(), port);
-            }
+                const auto& active_flight = task->flight;
+                if (active_flight->cancelled->load(std::memory_order_acquire)) return;
+                std::vector<ResolvedEndpoint> endpoints;
+                try {
+                    endpoints = task->resolver->resolve(task->host, task->port,
+                                                        active_flight->cancelled.get());
+                } catch (...) {
+                    KATHTTP3_LOG_ERR("resolver threw for %s:%u\n", task->host.c_str(), task->port);
+                }
 
-            std::vector<DnsWaiter> waiters;
-            {
+                std::vector<DnsWaiter> waiters;
+                {
+                    std::lock_guard<std::mutex> flights_lock(dns_flights_mutex());
+                    auto it = dns_flights().find(task->key);
+                    if (it != dns_flights().end() && it->second == active_flight) {
+                        waiters = std::move(it->second->waiters);
+                        dns_flights().erase(it);
+                    }
+                }
+                if (waiters.size() > 1) {
+                    KATHTTP3_LOG_DEBUG(
+                        "DNS single-flight completed %s:%u waiters=%zu endpoints=%zu\n",
+                        task->host.c_str(), task->port, waiters.size(), endpoints.size());
+                }
+                for (auto& waiter : waiters) {
+                    if (waiter.cancelled->load(std::memory_order_acquire)) continue;
+                    try {
+                        waiter.callback(endpoints);
+                    } catch (...) {
+                        KATHTTP3_LOG_WARN("DNS completion callback threw for %s:%u\n",
+                                          task->host.c_str(), task->port);
+                    }
+                }
+            } catch (...) {
+                KATHTTP3_LOG_ERR("DNS single-flight completion failed for %s:%u\n",
+                                 task->host.c_str(), task->port);
                 std::lock_guard<std::mutex> flights_lock(dns_flights_mutex());
-                auto it = dns_flights().find(key);
-                if (it != dns_flights().end() && it->second == flight) {
-                    waiters = std::move(it->second->waiters);
+                auto it = dns_flights().find(task->key);
+                if (it != dns_flights().end() && it->second == task->flight) {
+                    task->flight->cancelled->store(true, std::memory_order_release);
                     dns_flights().erase(it);
                 }
             }
-            if (waiters.size() > 1) {
-                KATHTTP3_LOG_DEBUG("DNS single-flight completed %s:%u waiters=%zu endpoints=%zu\n",
-                                   host.c_str(), port, waiters.size(), endpoints.size());
-            }
-            for (auto& waiter : waiters) {
-                if (waiter.cancelled->load(std::memory_order_acquire)) continue;
-                try {
-                    waiter.callback(endpoints);
-                } catch (...) {
-                    KATHTTP3_LOG_WARN("DNS completion callback threw for %s:%u\n", host.c_str(),
-                                      port);
-                }
-            }
-        });
+        },
+        flight->cancelled);
     if (!submitted) dns_flights().erase(key);
     return submitted;
+}
+
+void cancel_resolve(const std::shared_ptr<std::atomic<bool>>& cancelled) {
+    if (!cancelled) return;
+    cancelled->store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(dns_flights_mutex());
+        for (auto it = dns_flights().begin(); it != dns_flights().end();) {
+            const auto& flight = it->second;
+            flight->waiters.erase(std::remove_if(flight->waiters.begin(), flight->waiters.end(),
+                                                 [&](const DnsWaiter& waiter) {
+                                                     return waiter.cancelled == cancelled;
+                                                 }),
+                                  flight->waiters.end());
+            if (flight->waiters.empty()) {
+                flight->cancelled->store(true, std::memory_order_release);
+                it = dns_flights().erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    dns_worker_pool().prune_cancelled();
 }
 
 std::vector<ResolvedEndpoint> GetAddrInfoResolver::resolve(const std::string& host, uint16_t port,

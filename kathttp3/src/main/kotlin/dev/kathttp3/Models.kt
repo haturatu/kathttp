@@ -92,7 +92,18 @@ sealed interface KatHttp3RequestBody {
     data class Stream(val contentLength: Long? = null, val source: Flow<ByteArray>) : KatHttp3RequestBody
 }
 
-data class KatHttp3Request(val method: String, val url: String, val headers: List<KatHttp3Header> = emptyList(), val body: ByteArray? = null, val streamingBody: KatHttp3RequestBody? = null) {
+/** Local request-admission priority. It follows RFC 9218 urgency ordering:
+ * zero is most urgent and seven is background. [incremental] is retained for
+ * callers that also send an HTTP Priority header, but local admission uses
+ * urgency only. */
+data class KatHttp3RequestPriority(
+    val urgency: Int = 3,
+    val incremental: Boolean = false,
+) {
+    init { require(urgency in 0..7) }
+}
+
+data class KatHttp3Request(val method: String, val url: String, val headers: List<KatHttp3Header> = emptyList(), val body: ByteArray? = null, val streamingBody: KatHttp3RequestBody? = null, val priority: KatHttp3RequestPriority = KatHttp3RequestPriority()) {
     init { require(method.matches(Regex("[A-Z!#$%&'*+.^_`|~-]+"))); require(url.startsWith("https://")) }
 }
 
