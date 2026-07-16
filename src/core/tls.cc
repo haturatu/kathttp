@@ -36,6 +36,10 @@ constexpr uint8_t H3_ALPN[] = {'\x2', 'h', '3'};
 int g_ctx_ex_index = -1;     /* SSL_CTX ex_data: active verifier */
 int g_session_ex_index = -1; /* SSL ex_data: TlsClientSession* */
 
+std::string new_token_key(const std::string& server_name, uint64_t network_handle, int family) {
+    return server_name + "|" + std::to_string(network_handle) + "|" + std::to_string(family);
+}
+
 void ensure_ex_indices() {
     if (g_ctx_ex_index == -1)
         g_ctx_ex_index = SSL_CTX_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
@@ -154,6 +158,22 @@ void TlsClientContext::cache_resumption(const std::string& server_name, SSL* ssl
     SSL_SESSION_free(slot.session);
     slot.session = session;
     slot.transport_params = std::move(transport_params);
+}
+
+std::vector<uint8_t> TlsClientContext::acquire_new_token(const std::string& server_name,
+                                                         uint64_t network_handle, int family) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    const auto it = new_tokens_.find(new_token_key(server_name, network_handle, family));
+    return it == new_tokens_.end() ? std::vector<uint8_t>{} : it->second;
+}
+
+void TlsClientContext::cache_new_token(const std::string& server_name, uint64_t network_handle,
+                                       int family, const uint8_t* token, size_t tokenlen) {
+    constexpr size_t kMaxNewTokenBytes = 4096;
+    if (server_name.empty() || !token || tokenlen == 0 || tokenlen > kMaxNewTokenBytes) return;
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    new_tokens_[new_token_key(server_name, network_handle, family)] =
+        std::vector<uint8_t>(token, token + tokenlen);
 }
 
 bool TlsClientContext::init(kathttp3_trust_mode trust_mode, bool insecure,

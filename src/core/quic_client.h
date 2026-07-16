@@ -129,6 +129,9 @@ class QuicClient {
         const auto state = state_.load(std::memory_order_acquire);
         return connection_state_accepts_new_jobs(state, closed_.load(std::memory_order_acquire));
     }
+    int peer_family() const {
+        return peer_endpoint_.family;
+    }
 
     /* Human-readable BoringSSL/OpenSSL error queue (clears it). */
     const std::string& lastTlsError() const {
@@ -179,10 +182,11 @@ class QuicClient {
     bool on_stream_close(int64_t stream_id, uint64_t app_error_code);
     bool on_stream_reset(int64_t stream_id, uint64_t app_error_code);
     bool on_stream_stop_sending(int64_t stream_id, uint64_t app_error_code);
-    void generate_reset_token(uint8_t* token, const ngtcp2_cid* cid);
+    bool generate_reset_token(uint8_t* token, const ngtcp2_cid* cid);
     void on_early_data_rejected();
     void on_goaway(int64_t stream_id);
     void on_path_validation(ngtcp2_path_validation_result result);
+    void cache_new_token(const uint8_t* token, size_t tokenlen, int family);
     void try_submit_pending();
     void write_pending();
     void note_write_progress(int64_t stream_id);
@@ -260,6 +264,7 @@ class QuicClient {
     uint64_t current_network_handle_ = 0;
     bool migration_in_progress_ = false;
     bool socket_failed_ = false;
+    std::atomic<bool> random_failed_{false};
 
     UdpSocket sock_;
     int wakeup_fd_ = -1;

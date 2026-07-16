@@ -65,6 +65,14 @@ class TlsClientContext {
     void cache_resumption(const std::string& server_name, SSL* ssl,
                           std::vector<uint8_t> transport_params);
 
+    /* NEW_TOKEN is address-validation state.  Keep it only in memory and
+     * partition it by the Android network and address family so a token is
+     * never replayed across a path change. */
+    std::vector<uint8_t> acquire_new_token(const std::string& server_name, uint64_t network_handle,
+                                           int family);
+    void cache_new_token(const std::string& server_name, uint64_t network_handle, int family,
+                         const uint8_t* token, size_t tokenlen);
+
    private:
     SSL_CTX* ssl_ctx_ = nullptr;
     std::unique_ptr<CertificateVerifier> owned_verifier_;
@@ -76,6 +84,7 @@ class TlsClientContext {
         std::vector<uint8_t> transport_params;
     };
     std::unordered_map<std::string, CachedResumption> resumptions_;
+    std::unordered_map<std::string, std::vector<uint8_t>> new_tokens_;
 };
 
 /* A single QUIC connection's TLS session (one SSL object). */
