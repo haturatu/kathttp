@@ -227,6 +227,10 @@ KatHttp3 also applies local, origin-scoped admission control before a request is
 created in native code. `maxActiveStreamsPerOrigin` defaults to 8,
 `maxQueuedRequestsPerOrigin` to 64, and `queueTimeoutMillis` to 30 seconds.
 This is a client resource limit, not QUIC's peer-advertised `MAX_STREAMS`.
+Queued calls are selected by `KatHttp3Request.priority.urgency` using RFC 9218's
+0 (most urgent) through 7 (background) ordering, with FIFO ordering inside one
+urgency. Priority affects local admission only; applications that want to
+signal the server must also provide the HTTP `priority` header.
 Queue waiting does not consume response-header, read-idle, or write-idle time;
 it ends with `KatHttp3Exception.RequestQueueTimeout` or
 `KatHttp3Exception.RequestQueueFull` before native stream creation.
@@ -349,9 +353,15 @@ appended only. Symbols are hidden by default except `kathttp3_*` exports.
 - DNS lookups run in a bounded two-thread resolver pool rather than on a QUIC
   worker. Concurrent lookups for the same case-insensitive hostname, port,
   resolver, and Android network generation share one in-flight query; each
-  caller waits asynchronously and may cancel without cancelling its peers.
+  caller waits asynchronously and may cancel without cancelling its peers. A
+  reusable Active or Connecting origin connection is selected before a new
+  client can submit DNS. When the 32-task worker queue is full, up to 128
+  additional unique hosts wait in a bounded host queue; duplicate hosts still
+  attach to their existing flight. Cancellation and DNS deadline expiry remove
+  their waiter immediately, and work with no remaining waiters is skipped.
   Platform DNS caching remains owned by Android/libc because `InetAddress` and
-  `getaddrinfo` do not expose authoritative TTLs. The bundled DoH resolver
+  `getaddrinfo` do not expose authoritative TTLs; a five-second native success
+  cache only absorbs immediate request bursts and never caches failures. The bundled DoH resolver
   caches successful A/AAAA results for the minimum answer TTL and caches
   NXDOMAIN/NODATA only when an SOA supplies the RFC 2308 negative TTL; malformed,
   timeout, and SOA-less failures are not cached. Network changes partition
@@ -364,6 +374,10 @@ appended only. Symbols are hidden by default except `kathttp3_*` exports.
   loser socket and QUIC state are released. Additional addresses retain the
   sequential fallback path. This is a connection-establishment race, not QUIC
   connection migration.
+- JNI caches callback/resolver classes and method IDs at `JNI_OnLoad`. Native
+  DNS and QUIC workers attach as daemon threads once, reuse their thread-local
+  `JNIEnv*`, and detach when the worker exits; `JNIEnv*` is never shared across
+  threads.
 - Redirects reject HTTPS-to-HTTP downgrades and strip Authorization,
   Proxy-Authorization, Cookie, and Host on cross-origin hops. The cookie jar
   is experimental and disabled by default (`enableCookies = true` is explicit

@@ -107,7 +107,10 @@ QuicClient* Engine::get_or_create_client(const Url& origin) {
     std::lock_guard<std::mutex> lk(pool_mutex_);
     auto it = pool_.find(key);
     if (it != pool_.end()) {
-        if (it->second->is_closed() || it->second->is_draining()) {
+        // Reuse both Active and Connecting clients before any new client can
+        // enqueue DNS. Requests arriving during a handshake stay on that
+        // client's pending queue rather than starting duplicate resolution.
+        if (!it->second->accepts_new_jobs()) {
             // erase the entry itself. Keeping an empty entry makes the
             // emplace below fail for this key, leaving us with a dangling
             // pointer to the just-destroyed replacement client.

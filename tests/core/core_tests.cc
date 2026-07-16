@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 
+#include "connection_state.h"
 #include "cookie_jar.h"
 #include "dns.h"
 #include "flow_control.h"
@@ -180,7 +181,7 @@ int main() {
                           flight_completed.notify_one();
                       });
     assert(live_waiter_scheduled);
-    cancelled_waiter->store(true, std::memory_order_release);
+    cancel_resolve(cancelled_waiter);
     {
         std::lock_guard<std::mutex> lock(flight_mutex);
         release_upstream = true;
@@ -191,6 +192,58 @@ int main() {
         const bool live_completed = flight_completed.wait_for(
             lock, std::chrono::seconds(1), [&] { return completed_waiters == 1; });
         assert(live_completed);
+    }
+
+    // More unique hosts than the worker queue can hold move into the bounded
+    // host-pending queue instead of failing admission. Cancelling queued hosts
+    // removes their waiters and prevents their resolver callbacks from running.
+    std::mutex saturation_mutex;
+    std::condition_variable saturation_entered;
+    std::condition_variable saturation_release;
+    std::condition_variable saturation_completed;
+    bool release_saturated_workers = false;
+    size_t saturated_upstream_calls = 0;
+    size_t saturated_completions = 0;
+    auto saturation_resolver = std::make_shared<CallbackResolver>(
+        [&](const std::string&, uint16_t port, const std::atomic<bool>*) {
+            std::unique_lock<std::mutex> lock(saturation_mutex);
+            ++saturated_upstream_calls;
+            saturation_entered.notify_all();
+            saturation_release.wait(lock, [&] { return release_saturated_workers; });
+            return std::vector<ResolvedEndpoint>{{"192.0.2.30", port, AF_INET}};
+        });
+    constexpr size_t kSaturatedHostCount = 40;
+    std::vector<std::shared_ptr<std::atomic<bool>>> saturated_cancellations;
+    saturated_cancellations.reserve(kSaturatedHostCount);
+    for (size_t i = 0; i < kSaturatedHostCount; ++i) {
+        auto token = std::make_shared<std::atomic<bool>>(false);
+        saturated_cancellations.push_back(token);
+        const bool accepted =
+            resolve_async(saturation_resolver, "queue-" + std::to_string(i) + ".test", 443, token,
+                          [&](std::vector<ResolvedEndpoint>) {
+                              std::lock_guard<std::mutex> lock(saturation_mutex);
+                              ++saturated_completions;
+                              saturation_completed.notify_all();
+                          });
+        assert(accepted);
+    }
+    {
+        std::unique_lock<std::mutex> lock(saturation_mutex);
+        assert(saturation_entered.wait_for(lock, std::chrono::seconds(1),
+                                           [&] { return saturated_upstream_calls == 2; }));
+    }
+    for (size_t i = 2; i < saturated_cancellations.size(); ++i)
+        cancel_resolve(saturated_cancellations[i]);
+    {
+        std::lock_guard<std::mutex> lock(saturation_mutex);
+        release_saturated_workers = true;
+    }
+    saturation_release.notify_all();
+    {
+        std::unique_lock<std::mutex> lock(saturation_mutex);
+        assert(saturation_completed.wait_for(lock, std::chrono::seconds(1),
+                                             [&] { return saturated_completions == 2; }));
+        assert(saturated_upstream_calls == 2);
     }
 
     // A replacement Android Network gets a distinct flight even for the same
@@ -258,6 +311,11 @@ int main() {
     assert(v4_plan.enabled() && v4_plan.primary == 0 && v4_plan.fallback == 1);
     assert(!make_happy_eyeballs_plan({v4_primary.front()}).enabled());
     assert(!make_happy_eyeballs_plan({{"invalid", 443, 0}, v4_primary.front()}).enabled());
+    assert(connection_state_accepts_new_jobs(ConnectionState::Connecting, false));
+    assert(connection_state_accepts_new_jobs(ConnectionState::Active, false));
+    assert(!connection_state_accepts_new_jobs(ConnectionState::Draining, false));
+    assert(!connection_state_accepts_new_jobs(ConnectionState::Closing, false));
+    assert(!connection_state_accepts_new_jobs(ConnectionState::Active, true));
 
     // Race selection is based on the recorded 1-RTT-ready transition, not
     // whichever candidate happens to be processed first by poll().
@@ -328,15 +386,15 @@ int main() {
     const bool invalidated_cache_hit = cache.lookup("one.test", 443, 1, cached);
     assert(!invalidated_cache_hit);
 
-    DnsCache platform_owned_ttl_cache;
-    platform_owned_ttl_cache.put_success("platform.test", 443, 1, endpoints);
+    DnsCache short_success_cache;
+    short_success_cache.put_success("platform.test", 443, 1, endpoints);
     cached.clear();
     const bool platform_positive_cache_hit =
-        platform_owned_ttl_cache.lookup("platform.test", 443, 1, cached);
-    assert(!platform_positive_cache_hit);
-    platform_owned_ttl_cache.put_failure("missing-platform.test", 443, 1);
+        short_success_cache.lookup("platform.test", 443, 1, cached);
+    assert(platform_positive_cache_hit);
+    short_success_cache.put_failure("missing-platform.test", 443, 1);
     const bool platform_negative_cache_hit =
-        platform_owned_ttl_cache.lookup("missing-platform.test", 443, 1, cached);
+        short_success_cache.lookup("missing-platform.test", 443, 1, cached);
     assert(!platform_negative_cache_hit);
     std::cout << "core tests passed\n";
 }

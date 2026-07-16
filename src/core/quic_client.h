@@ -16,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include "connection_state.h"
 #include "dns.h"
 #include "request.h"
 #include "response.h"
@@ -30,8 +31,6 @@ namespace kathttp3 {
 class Engine;
 class Http3Session;
 struct HandshakeCandidate;
-
-enum class ConnectionState { None = 0, Connecting, Active, Draining, Closing, Closed };
 
 struct QuicTimeouts {
     uint64_t connect_ms = 0;
@@ -122,6 +121,10 @@ class QuicClient {
     }
     bool is_draining() const {
         return state_.load() == ConnectionState::Draining;
+    }
+    bool accepts_new_jobs() const {
+        const auto state = state_.load(std::memory_order_acquire);
+        return connection_state_accepts_new_jobs(state, closed_.load(std::memory_order_acquire));
     }
 
     /* Human-readable BoringSSL/OpenSSL error queue (clears it). */

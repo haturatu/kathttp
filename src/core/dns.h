@@ -67,7 +67,10 @@ class DnsCache {
    public:
     struct Config {
         size_t max_entries = 128;
-        uint64_t positive_ttl_ms = 0;
+        /* getaddrinfo does not expose TTL. Keep this fallback deliberately
+         * short; TTL-aware resolvers (such as DohResolver) retain their own
+         * authoritative cache and this layer only absorbs immediate bursts. */
+        uint64_t positive_ttl_ms = 5000;
         uint64_t negative_ttl_ms = 0;
     };
 
@@ -134,10 +137,15 @@ class CallbackResolver : public Resolver {
 /* Submit resolution to KatHttp3's bounded DNS worker pool.  The callback runs
  * on a DNS worker, therefore it must not touch a QuicClient directly.  The
  * caller owns its result state and can discard it by setting `cancelled`.
- * Returning false means that the bounded queue is full. */
+ * Returning false means that both the worker queue and bounded per-host
+ * overflow queue are full. */
 using DnsResolveCallback = std::function<void(std::vector<ResolvedEndpoint>)>;
 bool resolve_async(std::shared_ptr<Resolver> resolver, std::string host, uint16_t port,
                    std::shared_ptr<std::atomic<bool>> cancelled, DnsResolveCallback callback);
+/* Remove a waiter immediately when its request is cancelled or expires. If it
+ * was the last waiter, queued resolver work is discarded before execution and
+ * an already-running resolver receives its cooperative stop flag. */
+void cancel_resolve(const std::shared_ptr<std::atomic<bool>>& cancelled);
 
 } /* namespace kathttp3 */
 

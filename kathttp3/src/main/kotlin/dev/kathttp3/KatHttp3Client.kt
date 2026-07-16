@@ -49,7 +49,7 @@ class KatHttp3Client(private val config: KatHttp3ClientConfig = KatHttp3ClientCo
     private val networkMonitor = applicationContext?.let { AndroidNetworkMonitor(it) { generation -> synchronized(nativeLock) { if (!closed.get()) NativeBridge.networkChanged(handle, generation) } } }
 
     suspend fun execute(request: KatHttp3Request): KatHttp3Response {
-        requestScheduler.acquire(request.url).use {
+        requestScheduler.acquire(request.url, request.priority).use {
             return if (config.interceptors.isEmpty()) {
                 executeReal(request)
             } else {
@@ -144,7 +144,7 @@ class KatHttp3Client(private val config: KatHttp3ClientConfig = KatHttp3ClientCo
         val streamingLength = when (requestBody) { is KatHttp3RequestBody.FileBody -> requestBody.file.length(); is KatHttp3RequestBody.Stream -> requestBody.contentLength ?: -1L; else -> -1L }
         startJob = schedulerScope.launch {
             try {
-                permit.set(requestScheduler.acquire(request.url))
+                permit.set(requestScheduler.acquire(request.url, request.priority))
                 if (closed.get()) {
                     callback.fail(KatHttp3Exception.Closed())
                     return@launch

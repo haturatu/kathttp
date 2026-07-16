@@ -721,11 +721,11 @@ bool QuicClient::prepare_endpoints() {
         std::unique_lock<std::mutex> lock(result->mutex);
         while (!result->complete) {
             if (stop_.load(std::memory_order_acquire) || !has_live_pending_job()) {
-                cancelled->store(true, std::memory_order_release);
+                cancel_resolve(cancelled);
                 return false;
             }
             if (deadline_elapsed_ns(now_ns(), started, timeouts_.dns_ms * NGTCP2_MILLISECONDS)) {
-                cancelled->store(true, std::memory_order_release);
+                cancel_resolve(cancelled);
                 terminal_error_ = KATHTTP3_ERR_DNS_TIMEOUT;
                 return false;
             }
